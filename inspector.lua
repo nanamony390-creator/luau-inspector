@@ -590,7 +590,7 @@ local function buildUI()
 	ui.title.Position = UDim2.new(0, 0, 0, 0)
 	ui.title.BackgroundTransparency = 1
 	ui.title.TextColor3 = C.text
-	ui.title.Font = Enum.Font.GothicBold
+	ui.title.Font = Enum.Font.GothamBold
 	ui.title.TextSize = 16
 	ui.title.TextXAlignment = Enum.TextXAlignment.Left
 	ui.title.Text = "RUNTIME INSPECTOR"
