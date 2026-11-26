@@ -1,32 +1,29 @@
-local function service(name)
-	local ok, result = pcall(function()
+local function getServiceSafe(name)
+	local ok, svc = pcall(function()
 		return game:GetService(name)
 	end)
-	return ok and result or nil
+	return ok and svc or nil
 end
 
-local Players = service("Players")
-local ReplicatedStorage = service("ReplicatedStorage")
-local StarterPlayer = service("StarterPlayer")
-local StarterGui = service("StarterGui")
-local Workspace = service("Workspace")
-local CoreGui = service("CoreGui")
-local CollectionService = service("CollectionService")
-local UserInputService = service("UserInputService")
+local Players = getServiceSafe("Players")
+local ReplicatedStorage = getServiceSafe("ReplicatedStorage")
+local CoreGui = getServiceSafe("CoreGui")
+local CollectionService = getServiceSafe("CollectionService")
+local UserInputService = getServiceSafe("UserInputService")
 
 local GUI_TAG = "RuntimeInspector_7C1E9A"
 local GUARD_KEY = "__RuntimeInspectorGuard_" .. GUI_TAG
-local MAX_ENTRIES = 140
-local MAX_TARGET_HITS = 450
-local MAX_LIVE_EVENTS = 160
-local SCAN_BATCH = 90
+local MAX_ENTRIES = 120
+local MAX_TARGET_HITS = 350
+local MAX_LIVE_EVENTS = 120
+local SCAN_BATCH = 80
 local MIN_SCORE = 2
 
-local W, H = 520, 585
+local W, H = 520, 580
 local LIST_W = 302
 local DET_X, DET_W = 322, 188
 local TOP = 76
-local BOTTOM_H = 118
+local BOTTOM_H = 116
 local CONTENT_H = H - TOP - BOTTOM_H
 
 local connections = {}
@@ -42,7 +39,7 @@ local markCounter = 0
 
 local activeFilter = "All"
 local searchQuery = ""
-local rightViewMode = "Details" -- "Details" | "Live"
+local rightViewMode = "Details"
 local scanToken = 0
 local destroyed = false
 local ui = {}
@@ -60,19 +57,17 @@ local C = {
 	btn = Color3.fromRGB(52, 58, 72),
 }
 
-local PRIORITY_KEYWORDS = {
+local TARGET_KEYWORDS = {
 	"trait", "reroll", "roll", "potential", "stat", "cube", "token",
 	"rollback", "undo", "revert", "rejoin", "state", "save", "data",
 	"remote", "event", "function", "bindable", "unit", "equip",
-	"party", "invite", "trade", "gift", "craft", "blessing",
 }
 
 local VALUE_PROPS = {
 	Value = true, Position = true, CFrame = true, Size = true,
-	Velocity = true, Color = true, Material = true, Transparency = true,
-	Anchored = true, CanCollide = true, Health = true, MaxHealth = true,
-	WalkSpeed = true, Text = true, Visible = true, Enabled = true,
-	Name = true, ClassName = true,
+	Color = true, Transparency = true, Anchored = true, Health = true,
+	MaxHealth = true, WalkSpeed = true, Text = true, Visible = true,
+	Enabled = true, Name = true, ClassName = true,
 }
 
 local SKIP_CLASSES = {
@@ -84,7 +79,7 @@ local SKIP_CLASSES = {
 	UIAspectRatioConstraint = true, UIStroke = true,
 }
 
-local function safe(fn, ...)
+local function safeCall(fn, ...)
 	local ok, a, b = pcall(fn, ...)
 	if ok then
 		return a, b
@@ -92,29 +87,23 @@ local function safe(fn, ...)
 	return nil
 end
 
-local function getGlobalFn(name)
-	local okG, g = pcall(function()
+local function findExecutorFn(name)
+	local okEnv, env = pcall(function()
 		return type(getgenv) == "function" and getgenv() or nil
 	end)
-	if okG and type(g) == "table" and type(g[name]) == "function" then
-		return g[name]
+	if okEnv and type(env) == "table" and type(env[name]) == "function" then
+		return env[name]
 	end
 	if type(_G) == "table" and type(_G[name]) == "function" then
 		return _G[name]
 	end
-	local okDirect, fn = pcall(function()
-		return _G and rawget(_G, name)
-	end)
-	if okDirect and type(fn) == "function" then
-		return fn
-	end
 	return nil
 end
 
-local function copyToClipboard(text)
-	local setClip = getGlobalFn("setclipboard") or getGlobalFn("toclipboard")
-	if type(setClip) == "function" then
-		local ok = pcall(setClip, text)
+local function setClipboardSafe(text)
+	local fn = findExecutorFn("setclipboard") or findExecutorFn("toclipboard")
+	if type(fn) == "function" then
+		local ok = pcall(fn, text)
 		if ok then
 			return true
 		end
@@ -122,299 +111,273 @@ local function copyToClipboard(text)
 	return false
 end
 
-local function saveReportFile(text)
-	local writeFn = getGlobalFn("writefile")
-	if type(writeFn) == "function" then
-		return pcall(writeFn, "inspector_report.txt", text)
-	end
-	return false
-end
-
-local function printReportChunks(text)
+local function printChunksSafe(text)
 	local lines = string.split(text, "\n")
 	for i = 1, #lines, 16 do
-		local chunk = table.concat(lines, "\n", i, math.min(i + 15, #lines))
-		pcall(print, chunk)
+		local part = table.concat(lines, "\n", i, math.min(i + 15, #lines))
+		pcall(print, part)
 	end
 end
 
-local function trackGlobal(conn)
+local function trackConn(conn)
 	if conn then
 		connections[#connections + 1] = conn
 	end
 	return conn
 end
 
-local function getFullName(inst)
-	local ok, name = pcall(function()
-		return inst:GetFullName()
+local function propSafe(inst, propName)
+	local ok, val = pcall(function()
+		return inst[propName]
 	end)
-	if ok and type(name) == "string" then
-		return name
-	end
-	return safe(function()
-		return inst.Name
-	end) or "?"
+	return ok and val or nil
 end
 
-local function getAttributes(inst)
+local function isClass(inst, className)
+	local ok, res = pcall(function()
+		return inst:IsA(className)
+	end)
+	return ok and res or false
+end
+
+local function fullPathSafe(inst)
+	local ok, path = pcall(function()
+		return inst:GetFullName()
+	end)
+	if ok and type(path) == "string" then
+		return path
+	end
+	return tostring(propSafe(inst, "Name") or "?")
+end
+
+local function attrsSafe(inst)
 	local ok, attrs = pcall(function()
 		return inst:GetAttributes()
 	end)
-	if ok and typeof(attrs) == "table" then
-		return attrs
-	end
-	return {}
+	return (ok and typeof(attrs) == "table") and attrs or {}
 end
 
-local function getDebugId(inst)
+local function debugIdSafe(inst)
 	local ok, id = pcall(function()
 		return inst:GetDebugId()
 	end)
-	if ok then
-		return tostring(id)
-	end
-	return ""
+	return ok and tostring(id) or ""
 end
 
-local function readProp(inst, prop)
-	local ok, value = pcall(function()
-		return inst[prop]
-	end)
-	if ok then
-		return value
-	end
-	return nil
-end
-
-local function isA(inst, className)
-	local ok, result = pcall(function()
-		return inst:IsA(className)
-	end)
-	return ok and result or false
-end
-
-local function isSelf(inst)
+local function isOwnGui(inst)
 	if not ui.screenGui then
 		return false
 	end
-	local ok, result = pcall(function()
+	local ok, res = pcall(function()
 		return inst == ui.screenGui or inst:IsDescendantOf(ui.screenGui)
 	end)
-	return ok and result or false
+	return ok and res or false
 end
 
-local function formatValue(value)
-	local kind = typeof(value)
-	if kind == "nil" then
+local function fmtVal(val)
+	local t = typeof(val)
+	if t == "nil" then
 		return "nil"
-	elseif kind == "string" then
-		return "\"" .. string.sub(value, 1, 120) .. "\""
-	elseif kind == "number" or kind == "boolean" then
-		return tostring(value)
-	elseif kind == "Vector3" then
-		return string.format("(%.2f, %.2f, %.2f)", value.X, value.Y, value.Z)
-	elseif kind == "CFrame" then
-		local p = value.Position
+	elseif t == "string" then
+		return "\"" .. string.sub(val, 1, 100) .. "\""
+	elseif t == "number" or t == "boolean" then
+		return tostring(val)
+	elseif t == "Vector3" then
+		return string.format("(%.2f, %.2f, %.2f)", val.X, val.Y, val.Z)
+	elseif t == "CFrame" then
+		local p = val.Position
 		return string.format("CF(%.2f, %.2f, %.2f)", p.X, p.Y, p.Z)
-	elseif kind == "Color3" then
-		return string.format("RGB(%.0f, %.0f, %.0f)", value.R * 255, value.G * 255, value.B * 255)
-	elseif kind == "Instance" then
-		return getFullName(value)
-	elseif kind == "table" then
+	elseif t == "Color3" then
+		return string.format("RGB(%.0f, %.0f, %.0f)", val.R * 255, val.G * 255, val.B * 255)
+	elseif t == "Instance" then
+		return fullPathSafe(val)
+	elseif t == "table" then
 		return "table"
 	end
-	return tostring(value)
+	return tostring(val)
 end
 
-local function sortedPairs(t)
+local function pairsSorted(tbl)
 	local keys = {}
-	for key in pairs(t) do
-		keys[#keys + 1] = key
+	for k in pairs(tbl) do
+		keys[#keys + 1] = k
 	end
 	table.sort(keys, function(a, b)
 		return tostring(a) < tostring(b)
 	end)
-	local index = 0
+	local idx = 0
 	return function()
-		index += 1
-		if keys[index] == nil then
+		idx += 1
+		if keys[idx] == nil then
 			return nil
 		end
-		return keys[index], t[keys[index]]
+		return keys[idx], tbl[keys[idx]]
 	end
 end
 
-local function countKeys(t)
-	local count = 0
-	for _ in pairs(t) do
-		count += 1
+local function keyCount(tbl)
+	local n = 0
+	for _ in pairs(tbl) do
+		n += 1
 	end
-	return count
+	return n
 end
 
-local function keywordWeight(inst)
-	local nameLower = string.lower(tostring(readProp(inst, "Name") or ""))
-	local pathLower = string.lower(getFullName(inst))
-	local weight = 0
-	for _, kw in ipairs(PRIORITY_KEYWORDS) do
-		if string.find(nameLower, kw, 1, true) then
-			weight += 5
-		elseif string.find(pathLower, kw, 1, true) then
-			weight += 2
-		end
-	end
-	for k in pairs(getAttributes(inst)) do
-		local keyLower = string.lower(tostring(k))
-		for _, kw in ipairs(PRIORITY_KEYWORDS) do
-			if string.find(keyLower, kw, 1, true) then
-				weight += 3
-			end
-		end
-	end
-	return weight
-end
-
-local function isRemoteClass(className)
+local function isRemoteKind(className)
 	return className == "RemoteEvent"
 		or className == "RemoteFunction"
 		or className == "BindableEvent"
 		or className == "BindableFunction"
 end
 
-local function isValueClass(className)
+local function isValueKind(className)
 	return className == "BoolValue"
 		or className == "IntValue"
 		or className == "NumberValue"
 		or className == "StringValue"
 		or className == "ObjectValue"
-		or className == "Color3Value"
-		or className == "Vector3Value"
-		or className == "CFrameValue"
-		or className == "RayValue"
-		or className == "BrickColorValue"
 end
 
-local function isSystemOrTargetCandidate(inst)
-	if isSelf(inst) then
+local function targetWeight(inst)
+	local nameL = string.lower(tostring(propSafe(inst, "Name") or ""))
+	local pathL = string.lower(fullPathSafe(inst))
+	local w = 0
+	for _, kw in ipairs(TARGET_KEYWORDS) do
+		if string.find(nameL, kw, 1, true) then
+			w += 5
+		elseif string.find(pathL, kw, 1, true) then
+			w += 2
+		end
+	end
+	for attrName in pairs(attrsSafe(inst)) do
+		local attrL = string.lower(tostring(attrName))
+		for _, kw in ipairs(TARGET_KEYWORDS) do
+			if string.find(attrL, kw, 1, true) then
+				w += 3
+			end
+		end
+	end
+	return w
+end
+
+local function isTargetCandidate(inst)
+	if isOwnGui(inst) then
 		return false
 	end
-	local className = readProp(inst, "ClassName")
-	if SKIP_CLASSES[className] then
+	local cls = propSafe(inst, "ClassName")
+	if SKIP_CLASSES[cls] then
 		return false
 	end
-	if isRemoteClass(className) or className == "ModuleScript" or isValueClass(className) then
+	if isRemoteKind(cls) or cls == "ModuleScript" or isValueKind(cls) then
 		return true
 	end
-	return keywordWeight(inst) > 0
+	return targetWeight(inst) > 0
 end
 
-local function score(inst)
-	if isSelf(inst) then
+local function scoreInst(inst)
+	if isOwnGui(inst) then
 		return 0
 	end
-	local className = readProp(inst, "ClassName")
-	if SKIP_CLASSES[className] then
+	local cls = propSafe(inst, "ClassName")
+	if SKIP_CLASSES[cls] then
 		return 0
 	end
-	local value = keywordWeight(inst)
-	if isRemoteClass(className) then
-		value += 7
+	local s = targetWeight(inst)
+	if isRemoteKind(cls) then
+		s += 7
 	end
-	if className == "ModuleScript" then
-		value += 4
+	if cls == "ModuleScript" then
+		s += 4
 	end
-	if next(getAttributes(inst)) ~= nil then
-		value += 4
+	if next(attrsSafe(inst)) ~= nil then
+		s += 4
 	end
-	if isA(inst, "Humanoid") then
-		value += 5
+	if isClass(inst, "Humanoid") then
+		s += 5
 	end
-	if isA(inst, "Model") and readProp(inst, "PrimaryPart") then
-		value += 2
+	if isClass(inst, "Model") and propSafe(inst, "PrimaryPart") then
+		s += 2
 	end
-	if isValueClass(className) or isA(inst, "ValueBase") then
-		value += 3
+	if isValueKind(cls) or isClass(inst, "ValueBase") then
+		s += 3
 	end
-	if isA(inst, "BasePart") and readProp(inst, "Anchored") then
-		value += 1
+	if isClass(inst, "LayerCollector") then
+		s += 2
 	end
-	if isA(inst, "LayerCollector") then
-		value += 2
-	end
-	if className == "Player" then
-		value += 3
+	if cls == "Player" then
+		s += 3
 	end
 	local okTags, tags = pcall(function()
 		return CollectionService:GetTags(inst)
 	end)
 	if okTags and #tags > 0 then
-		value += 3
+		s += 3
 	end
-	return value
+	return s
 end
 
-local function buildInfo(inst)
+local function buildInstInfo(inst)
 	local info = {
-		name = tostring(readProp(inst, "Name") or "?"),
-		className = tostring(readProp(inst, "ClassName") or "?"),
-		fullName = getFullName(inst),
-		debugId = getDebugId(inst),
-		weight = keywordWeight(inst),
+		name = tostring(propSafe(inst, "Name") or "?"),
+		className = tostring(propSafe(inst, "ClassName") or "?"),
+		fullName = fullPathSafe(inst),
+		debugId = debugIdSafe(inst),
+		weight = targetWeight(inst),
 		attrs = {},
 		props = {},
 		propKeys = {},
 	}
-	for key, value in pairs(getAttributes(inst)) do
-		info.attrs[tostring(key)] = formatValue(value)
+	for k, v in pairs(attrsSafe(inst)) do
+		info.attrs[tostring(k)] = fmtVal(v)
 	end
-	for prop in pairs(VALUE_PROPS) do
-		local value = readProp(inst, prop)
-		if value ~= nil then
-			info.props[prop] = formatValue(value)
-			info.propKeys[#info.propKeys + 1] = prop
+	for propName in pairs(VALUE_PROPS) do
+		local v = propSafe(inst, propName)
+		if v ~= nil then
+			info.props[propName] = fmtVal(v)
+			info.propKeys[#info.propKeys + 1] = propName
 		end
-	end
-	local okTags, tags = pcall(function()
-		return CollectionService:GetTags(inst)
-	end)
-	if okTags and #tags > 0 then
-		info.props.Tags = table.concat(tags, ", ")
 	end
 	return info
 end
 
-local function formatInfoBlock(info)
+local function formatInfoText(info)
 	local lines = {
 		"Name: " .. info.name,
 		"Class: " .. info.className,
 		"Path: " .. info.fullName,
 		"DebugId: " .. info.debugId,
-		"Attributes (" .. countKeys(info.attrs) .. "):",
+		"Attributes (" .. keyCount(info.attrs) .. "):",
 	}
-	for key, value in sortedPairs(info.attrs) do
-		lines[#lines + 1] = "  " .. key .. " = " .. value
+	for k, v in pairsSorted(info.attrs) do
+		lines[#lines + 1] = "  " .. k .. " = " .. v
 	end
 	lines[#lines + 1] = "Properties:"
-	for key, value in sortedPairs(info.props) do
-		lines[#lines + 1] = "  " .. key .. " = " .. value
+	for k, v in pairsSorted(info.props) do
+		lines[#lines + 1] = "  " .. k .. " = " .. v
 	end
 	return table.concat(lines, "\n")
 end
 
-local function renderRightPanel()
+local function setStatus(msg)
+	if ui.statusLabel then
+		pcall(function()
+			ui.statusLabel.Text = tostring(msg)
+		end)
+	end
+end
+
+local function renderRightBox()
 	if not ui.details then
 		return
 	end
 	if rightViewMode == "Live" then
 		local lines = {
 			"=== LIVE NOW (Mark #" .. tostring(markCounter) .. ") ===",
-			"Events captured: " .. tostring(#liveEvents),
+			"Events: " .. tostring(#liveEvents),
 			"",
 		}
 		if #liveEvents == 0 then
-			lines[#lines + 1] = "No changes yet after Mark Now."
-			lines[#lines + 1] = "Perform action in-game (open/roll/toggle) to verify capture."
+			lines[#lines + 1] = "Waiting for changes after Mark Now..."
 		else
 			for i = math.max(1, #liveEvents - 35), #liveEvents do
 				lines[#lines + 1] = liveEvents[i]
@@ -428,16 +391,39 @@ local function renderRightPanel()
 
 	if ui.selected and ui.selected.info then
 		pcall(function()
-			ui.details.Text = formatInfoBlock(ui.selected.info)
+			ui.details.Text = formatInfoText(ui.selected.info)
 		end)
 	else
 		pcall(function()
-			ui.details.Text = "Select an item to inspect, or switch to Live Now."
+			ui.details.Text = "Select an item or switch to Live Now."
 		end)
 	end
 end
 
-local function recordInspected(info)
+local function pushLiveEvent(inst, tagText)
+	if #liveEvents >= MAX_LIVE_EVENTS or isOwnGui(inst) then
+		return
+	end
+	local prefix = (markCounter > 0) and ("[M" .. tostring(markCounter) .. "] ") or ""
+	local line = string.format(
+		"%s%s [%s] -> %s (%s)",
+		prefix,
+		tostring(propSafe(inst, "Name") or "?"),
+		tostring(propSafe(inst, "ClassName") or "?"),
+		fullPathSafe(inst),
+		tostring(tagText)
+	)
+	if liveEventSeen[line] then
+		return
+	end
+	liveEventSeen[line] = true
+	liveEvents[#liveEvents + 1] = line
+	if rightViewMode == "Live" then
+		renderRightBox()
+	end
+end
+
+local function pushInspected(info)
 	local key = tostring(info.fullName) .. "|" .. tostring(info.debugId)
 	if inspectedSeen[key] then
 		return
@@ -446,51 +432,12 @@ local function recordInspected(info)
 	inspectedHistory[#inspectedHistory + 1] = info
 end
 
-local function recordLiveEvent(inst, detail)
-	if #liveEvents >= MAX_LIVE_EVENTS or isSelf(inst) then
-		return
-	end
-	local path = getFullName(inst)
-	local tag = (markCounter > 0) and ("[M" .. tostring(markCounter) .. "] ") or ""
-	local line = string.format(
-		"%s%s [%s] -> %s (%s)",
-		tag,
-		tostring(readProp(inst, "Name") or "?"),
-		tostring(readProp(inst, "ClassName") or "?"),
-		path,
-		tostring(detail)
-	)
-	if liveEventSeen[line] then
-		return
-	end
-	liveEventSeen[line] = true
-	liveEvents[#liveEvents + 1] = line
-	if rightViewMode == "Live" then
-		renderRightPanel()
-	end
-end
-
-local function markCurrentMoment()
-	markCounter += 1
-	liveEvents = {}
-	liveEventSeen = {}
-	rightViewMode = "Live"
-	if ui.viewModeBtn then
-		pcall(function()
-			ui.viewModeBtn.Text = "View: Live Now"
-		end)
-	end
-	renderRightPanel()
-end
-
-local function matchesFilterAndSearch(info)
+local function itemMatchesView(info)
 	if activeFilter == "Target" and info.weight <= 0 then
 		return false
-	elseif activeFilter == "Remotes" and not isRemoteClass(info.className) then
+	elseif activeFilter == "Remotes" and not isRemoteKind(info.className) then
 		return false
 	elseif activeFilter == "Modules" and info.className ~= "ModuleScript" then
-		return false
-	elseif activeFilter == "Values" and not isValueClass(info.className) then
 		return false
 	end
 
@@ -513,32 +460,31 @@ local function matchesFilterAndSearch(info)
 	return true
 end
 
-local function refreshEntry(entry)
-	local row = entry.row
-	if not row then
+local function refreshRowStyle(entry)
+	if not entry or not entry.row then
 		return
 	end
 	local info = entry.info
-	local isSelected = (ui.selected == entry)
+	local sel = (ui.selected == entry)
 	pcall(function()
-		row.BackgroundColor3 = isSelected and C.rowSelected or C.row
-		row.Text = string.format(
+		entry.row.BackgroundColor3 = sel and C.rowSelected or C.row
+		entry.row.Text = string.format(
 			"%s [%s]  %s  (%d attrs)",
-			info.name, info.className, info.fullName, countKeys(info.attrs)
+			info.name, info.className, info.fullName, keyCount(info.attrs)
 		)
 	end)
 end
 
-local function applyFiltersToRows()
+local function applyViewFilter()
 	local shown = 0
 	for _, entry in ipairs(entryOrder) do
-		local visible = matchesFilterAndSearch(entry.info)
+		local vis = itemMatchesView(entry.info)
 		if entry.row then
 			pcall(function()
-				entry.row.Visible = visible
+				entry.row.Visible = vis
 			end)
 		end
-		if visible then
+		if vis then
 			shown += 1
 		end
 	end
@@ -550,51 +496,54 @@ local function applyFiltersToRows()
 			)
 		end)
 	end
-	for chipName, chipBtn in pairs(ui.chips or {}) do
+	for name, btn in pairs(ui.chips or {}) do
 		pcall(function()
-			chipBtn.BackgroundColor3 = (chipName == activeFilter) and C.chipActive or C.btn
+			btn.BackgroundColor3 = (name == activeFilter) and C.chipActive or C.btn
 		end)
 	end
 end
 
-local function selectEntry(entry)
-	if not entry or not ui.details then
+local function selectRowEntry(entry)
+	if not entry or destroyed then
 		return
 	end
-	local previous = ui.selected
+	local prev = ui.selected
 	ui.selected = entry
-	if previous and previous ~= entry then
-		refreshEntry(previous)
+	if prev and prev ~= entry then
+		refreshRowStyle(prev)
 	end
-	refreshEntry(entry)
-	recordInspected(entry.info)
-	recordLiveEvent(entry.inst, "inspected")
+	refreshRowStyle(entry)
+	pushInspected(entry.info)
+	pushLiveEvent(entry.inst, "inspected")
 	rightViewMode = "Details"
 	if ui.viewModeBtn then
 		pcall(function()
 			ui.viewModeBtn.Text = "View: Details"
 		end)
 	end
-	renderRightPanel()
-	applyFiltersToRows()
+	renderRightBox()
+	applyViewFilter()
 end
 
-local function clearEntry(entry)
+local function disposeEntry(entry)
+	if not entry then
+		return
+	end
 	if entry.row then
 		pcall(function()
 			entry.row:Destroy()
 		end)
 		entry.row = nil
 	end
-	for _, conn in ipairs(entry.conns) do
+	for _, c in ipairs(entry.conns) do
 		pcall(function()
-			conn:Disconnect()
+			c:Disconnect()
 		end)
 	end
 	entry.conns = {}
 end
 
-local function createRow(entry)
+local function makeRow(entry)
 	local row = Instance.new("TextButton")
 	row.Name = "Row"
 	row.Size = UDim2.new(1, -12, 0, 34)
@@ -605,12 +554,12 @@ local function createRow(entry)
 	row.Font = Enum.Font.SourceSans
 	row.TextSize = 13
 	row.Text = ""
-	row.Visible = matchesFilterAndSearch(entry.info)
+	row.Visible = itemMatchesView(entry.info)
 
-	local padding = Instance.new("UIPadding")
-	padding.PaddingLeft = UDim.new(0, 8)
-	padding.PaddingRight = UDim.new(0, 8)
-	padding.Parent = row
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 8)
+	pad.PaddingRight = UDim.new(0, 8)
+	pad.Parent = row
 
 	local corner = Instance.new("UICorner")
 	corner.CornerRadius = UDim.new(0, 4)
@@ -618,29 +567,16 @@ local function createRow(entry)
 
 	row.Parent = ui.list
 	entry.row = row
-	refreshEntry(entry)
+	refreshRowStyle(entry)
 
 	entry.conns[#entry.conns + 1] = row.Activated:Connect(function()
 		if not destroyed then
-			selectEntry(entry)
+			selectRowEntry(entry)
 		end
 	end)
 end
 
-local function updateCounts()
-	applyFiltersToRows()
-end
-
-local function updateStatus(text)
-	if not ui.statusLabel then
-		return
-	end
-	pcall(function()
-		ui.statusLabel.Text = text
-	end)
-end
-
-local function addEntry(inst)
+local function insertEntry(inst)
 	if entries[inst] or destroyed or entryCount >= MAX_ENTRIES then
 		return
 	end
@@ -650,60 +586,58 @@ local function addEntry(inst)
 		return
 	end
 
-	local info = buildInfo(inst)
+	local info = buildInstInfo(inst)
 	local entry = { inst = inst, info = info, row = nil, conns = {} }
 	entries[inst] = entry
 	entryOrder[#entryOrder + 1] = entry
 	entryCount += 1
 
-	local okAttr, attrSignal = pcall(function()
+	local okAttr, attrSig = pcall(function()
 		return inst.AttributeChanged
 	end)
-	if okAttr and attrSignal then
-		local conn = attrSignal:Connect(function(attribute)
+	if okAttr and attrSig then
+		entry.conns[#entry.conns + 1] = attrSig:Connect(function(attrName)
 			if destroyed or entries[inst] ~= entry then
 				return
 			end
-			local okValue, value = pcall(function()
-				return inst:GetAttribute(attribute)
+			local okV, v = pcall(function()
+				return inst:GetAttribute(attrName)
 			end)
-			local formatted = okValue and formatValue(value) or "?"
-			entry.info.attrs[tostring(attribute)] = formatted
-			recordLiveEvent(inst, "attr:" .. tostring(attribute) .. "=" .. formatted)
-			refreshEntry(entry)
+			local formatted = okV and fmtVal(v) or "?"
+			entry.info.attrs[tostring(attrName)] = formatted
+			pushLiveEvent(inst, "attr:" .. tostring(attrName) .. "=" .. formatted)
+			refreshRowStyle(entry)
 			if ui.selected == entry and rightViewMode == "Details" then
-				renderRightPanel()
+				renderRightBox()
 			end
-			updateCounts()
+			applyViewFilter()
 		end)
-		entry.conns[#entry.conns + 1] = conn
 	end
 
-	for _, prop in ipairs(info.propKeys) do
-		local okSignal, signal = pcall(function()
-			return inst:GetPropertyChangedSignal(prop)
+	for _, propName in ipairs(info.propKeys) do
+		local okSig, sig = pcall(function()
+			return inst:GetPropertyChangedSignal(propName)
 		end)
-		if okSignal and signal then
-			local conn = signal:Connect(function()
+		if okSig and sig then
+			entry.conns[#entry.conns + 1] = sig:Connect(function()
 				if destroyed or entries[inst] ~= entry then
 					return
 				end
-				local formatted = formatValue(readProp(inst, prop))
-				entry.info.props[prop] = formatted
-				if prop == "Value" or prop == "Visible" or prop == "Text" then
-					recordLiveEvent(inst, prop .. "=" .. formatted)
+				local formatted = fmtVal(propSafe(inst, propName))
+				entry.info.props[propName] = formatted
+				if propName == "Value" or propName == "Visible" or propName == "Text" then
+					pushLiveEvent(inst, propName .. "=" .. formatted)
 				end
 				if ui.selected == entry and rightViewMode == "Details" then
-					renderRightPanel()
+					renderRightBox()
 				end
-				updateCounts()
+				applyViewFilter()
 			end)
-			entry.conns[#entry.conns + 1] = conn
 		end
 	end
 
-	createRow(entry)
-	updateCounts()
+	makeRow(entry)
+	applyViewFilter()
 end
 
 local function removeEntry(inst)
@@ -711,7 +645,7 @@ local function removeEntry(inst)
 	if not entry then
 		return
 	end
-	clearEntry(entry)
+	disposeEntry(entry)
 	entries[inst] = nil
 	for i, item in ipairs(entryOrder) do
 		if item == entry then
@@ -722,216 +656,194 @@ local function removeEntry(inst)
 	entryCount = math.max(0, entryCount - 1)
 	if ui.selected == entry then
 		ui.selected = nil
-		renderRightPanel()
+		renderRightBox()
 	end
-	updateCounts()
+	applyViewFilter()
 end
 
-local function clearEntries()
+local function clearListEntries()
 	for inst, entry in pairs(entries) do
-		clearEntry(entry)
+		disposeEntry(entry)
 		entries[inst] = nil
 	end
 	entryOrder = {}
 	entryCount = 0
 	ui.selected = nil
-	renderRightPanel()
-	updateCounts()
+	renderRightBox()
+	applyViewFilter()
 end
 
-local function clearLogs()
+local function clearLogsData()
 	inspectedHistory = {}
 	inspectedSeen = {}
 	liveEvents = {}
 	liveEventSeen = {}
 	markCounter = 0
-	renderRightPanel()
-	updateCounts()
+	renderRightBox()
+	applyViewFilter()
 end
 
-local function collectSystemReport()
-	local sections = {
-		"=== RUNTIME INSPECTOR FULL SYSTEM REPORT ===",
+local function buildFullReport()
+	local out = {
+		"=== RUNTIME INSPECTOR REPORT ===",
 		"Target Scope: Trait Reroll / Stats & Potential Reroll / Rollback & State / Remotes",
-		"Mark Index: #" .. tostring(markCounter),
-		"Inspected By User Count: " .. tostring(#inspectedHistory),
-		"Live Events Count: " .. tostring(#liveEvents),
+		"Mark #" .. tostring(markCounter) .. " | Inspected: " .. tostring(#inspectedHistory) .. " | Live: " .. tostring(#liveEvents),
 		"",
-		"--- [1] USER INSPECTED ITEMS ---",
+		"--- [1] USER INSPECTED ---",
 	}
 
 	if #inspectedHistory == 0 then
-		sections[#sections + 1] = "(None clicked yet)"
+		out[#out + 1] = "(None)"
 	else
 		for i, info in ipairs(inspectedHistory) do
-			sections[#sections + 1] = "[" .. i .. "] " .. formatInfoBlock(info)
-			sections[#sections + 1] = "----------------------------------------"
+			out[#out + 1] = "[" .. i .. "] " .. formatInfoText(info)
+			out[#out + 1] = "----------------------------------------"
 		end
 	end
 
-	sections[#sections + 1] = ""
-	sections[#sections + 1] = "--- [2] LIVE NOW EVENTS ---"
+	out[#out + 1] = ""
+	out[#out + 1] = "--- [2] LIVE NOW EVENTS ---"
 	if #liveEvents == 0 then
-		sections[#sections + 1] = "(No live events recorded)"
+		out[#out + 1] = "(None)"
 	else
 		for _, line in ipairs(liveEvents) do
-			sections[#sections + 1] = line
+			out[#out + 1] = line
 		end
 	end
 
-	sections[#sections + 1] = ""
-	sections[#sections + 1] = "--- [3] MATCHED SYSTEM CANDIDATES (REMOTES / MODULES / VALUES / TRAIT / REROLL / STATE) ---"
+	out[#out + 1] = ""
+	out[#out + 1] = "--- [3] SYSTEM CANDIDATES (REMOTES / MODULES / VALUES / TRAIT / REROLL / STATE) ---"
 
 	local roots = {}
 	if ReplicatedStorage then
 		roots[#roots + 1] = ReplicatedStorage
 	end
-	local localPlayer = Players and Players.LocalPlayer
-	if localPlayer then
-		roots[#roots + 1] = localPlayer
-		local pg = safe(function()
-			return localPlayer:FindFirstChildOfClass("PlayerGui")
+	local lp = Players and Players.LocalPlayer
+	if lp then
+		roots[#roots + 1] = lp
+		local pg = safeCall(function()
+			return lp:FindFirstChildOfClass("PlayerGui")
 		end)
 		if pg then
 			roots[#roots + 1] = pg
 		end
 	end
-	if StarterPlayer then
-		roots[#roots + 1] = StarterPlayer
-	end
-	if StarterGui then
-		roots[#roots + 1] = StarterGui
-	end
-	if Workspace then
-		roots[#roots + 1] = Workspace
-	end
 
-	local candidates = {}
-	local seenPaths = {}
-
+	local found = {}
+	local seen = {}
 	for _, root in ipairs(roots) do
-		local okDesc, desc = pcall(function()
+		local okD, desc = pcall(function()
 			return root:GetDescendants()
 		end)
-		if okDesc and type(desc) == "table" then
+		if okD and type(desc) == "table" then
 			for _, inst in ipairs(desc) do
-				if typeof(inst) == "Instance" and isSystemOrTargetCandidate(inst) then
-					local info = buildInfo(inst)
-					if not seenPaths[info.fullName] then
-						seenPaths[info.fullName] = true
-						candidates[#candidates + 1] = info
+				if typeof(inst) == "Instance" and isTargetCandidate(inst) then
+					local info = buildInstInfo(inst)
+					if not seen[info.fullName] then
+						seen[info.fullName] = true
+						found[#found + 1] = info
 					end
 				end
 			end
 		end
 	end
 
-	table.sort(candidates, function(a, b)
+	table.sort(found, function(a, b)
 		if a.weight ~= b.weight then
 			return a.weight > b.weight
 		end
 		return tostring(a.fullName) < tostring(b.fullName)
 	end)
 
-	local matched = math.min(#candidates, MAX_TARGET_HITS)
-	for i = 1, matched do
-		local info = candidates[i]
-		sections[#sections + 1] = string.format(
-			"• [w=%d] %s [%s] -> %s",
-			info.weight, info.name, info.className, info.fullName
-		)
-		if countKeys(info.attrs) > 0 then
-			for k, v in sortedPairs(info.attrs) do
-				sections[#sections + 1] = "    attr " .. k .. " = " .. v
-			end
+	local limit = math.min(#found, MAX_TARGET_HITS)
+	for i = 1, limit do
+		local info = found[i]
+		out[#out + 1] = string.format("• [w=%d] %s [%s] -> %s", info.weight, info.name, info.className, info.fullName)
+		for k, v in pairsSorted(info.attrs) do
+			out[#out + 1] = "    attr " .. k .. " = " .. v
 		end
 		if info.props.Value ~= nil then
-			sections[#sections + 1] = "    Value = " .. tostring(info.props.Value)
+			out[#out + 1] = "    Value = " .. tostring(info.props.Value)
 		end
 		if info.props.Visible ~= nil then
-			sections[#sections + 1] = "    Visible = " .. tostring(info.props.Visible)
+			out[#out + 1] = "    Visible = " .. tostring(info.props.Visible)
 		end
 	end
 
-	sections[#sections + 1] = ""
-	sections[#sections + 1] = string.format("Total Matched System Items: %d (of %d found)", matched, #candidates)
-	return table.concat(sections, "\n"), matched
+	out[#out + 1] = ""
+	out[#out + 1] = "Matched: " .. tostring(limit) .. " / " .. tostring(#found)
+	return table.concat(out, "\n"), limit
 end
 
-local function startScan()
+local function runScan()
 	scanToken += 1
 	local token = scanToken
-	clearEntries()
+	clearListEntries()
 
 	local okList, list = pcall(function()
 		return game:GetDescendants()
 	end)
 	if not okList or type(list) ~= "table" then
-		updateStatus("Scan failed")
+		setStatus("Scan failed")
 		return
 	end
 
-	local index = 1
-	updateStatus("Scanning 0/" .. #list)
+	local idx = 1
+	setStatus("Scanning 0/" .. #list)
 
 	task.defer(function()
-		while not destroyed
-			and token == scanToken
-			and index <= #list
-			and entryCount < MAX_ENTRIES
-		do
-			local processed = 0
-			while index <= #list and processed < SCAN_BATCH and entryCount < MAX_ENTRIES do
-				local inst = list[index]
-				index += 1
-				processed += 1
-				if typeof(inst) == "Instance" then
-					local value = score(inst)
-					if value >= MIN_SCORE then
-						addEntry(inst)
-					end
+		while not destroyed and token == scanToken and idx <= #list and entryCount < MAX_ENTRIES do
+			local step = 0
+			while idx <= #list and step < SCAN_BATCH and entryCount < MAX_ENTRIES do
+				local inst = list[idx]
+				idx += 1
+				step += 1
+				if typeof(inst) == "Instance" and scoreInst(inst) >= MIN_SCORE then
+					insertEntry(inst)
 				end
 			end
-			updateStatus(string.format("Scanning %d/%d - %d shown", index - 1, #list, entryCount))
+			setStatus(string.format("Scanning %d/%d - %d shown", idx - 1, #list, entryCount))
 			task.wait()
 		end
 		if not destroyed and token == scanToken then
-			updateStatus(string.format("Done - %d/%d scanned, %d shown", index - 1, #list, entryCount))
+			setStatus(string.format("Done - %d shown", entryCount))
 		end
 	end)
 end
 
-local function setVisible(visible)
+local function setGuiVisible(vis)
 	if not ui.main then
 		return
 	end
 	local ok = pcall(function()
-		ui.main.Visible = visible
+		ui.main.Visible = vis
 	end)
 	if ok then
-		ui.visible = visible
-		pcall(function()
-			ui.toggleBtn.Text = visible and "Hide" or "Show"
-		end)
+		ui.visible = vis
+		if ui.toggleBtn then
+			pcall(function()
+				ui.toggleBtn.Text = vis and "Hide" or "Show"
+			end)
+		end
 	end
 end
 
-local function destroy()
+local function cleanupInspector()
 	if destroyed then
 		return
 	end
 	destroyed = true
 	scanToken += 1
 
-	for _, conn in ipairs(connections) do
+	for _, c in ipairs(connections) do
 		pcall(function()
-			conn:Disconnect()
+			c:Disconnect()
 		end)
 	end
 	connections = {}
 
 	for inst, entry in pairs(entries) do
-		clearEntry(entry)
+		disposeEntry(entry)
 		entries[inst] = nil
 	end
 	entryOrder = {}
@@ -945,7 +857,7 @@ local function destroy()
 	ui = {}
 end
 
-local function buildUI()
+local function buildInspectorUI()
 	ui.screenGui = Instance.new("ScreenGui")
 	ui.screenGui.Name = GUI_TAG
 	ui.screenGui.ResetOnSpawn = false
@@ -956,7 +868,7 @@ local function buildUI()
 	ui.toggleBtn = Instance.new("TextButton")
 	ui.toggleBtn.Name = "Toggle"
 	ui.toggleBtn.Size = UDim2.new(0, 86, 0, 26)
-	ui.toggleBtn.Position = UDim2.new(0, 20, 0, 615)
+	ui.toggleBtn.Position = UDim2.new(0, 20, 0, 610)
 	ui.toggleBtn.BackgroundColor3 = C.btn
 	ui.toggleBtn.BorderSizePixel = 0
 	ui.toggleBtn.TextColor3 = C.text
@@ -965,9 +877,9 @@ local function buildUI()
 	ui.toggleBtn.Text = "Hide"
 	ui.toggleBtn.Parent = ui.screenGui
 
-	local toggleCorner = Instance.new("UICorner")
-	toggleCorner.CornerRadius = UDim.new(0, 5)
-	toggleCorner.Parent = ui.toggleBtn
+	local tCorner = Instance.new("UICorner")
+	tCorner.CornerRadius = UDim.new(0, 5)
+	tCorner.Parent = ui.toggleBtn
 
 	ui.main = Instance.new("Frame")
 	ui.main.Name = "Main"
@@ -977,9 +889,9 @@ local function buildUI()
 	ui.main.BorderSizePixel = 0
 	ui.main.Parent = ui.screenGui
 
-	local mainCorner = Instance.new("UICorner")
-	mainCorner.CornerRadius = UDim.new(0, 8)
-	mainCorner.Parent = ui.main
+	local mCorner = Instance.new("UICorner")
+	mCorner.CornerRadius = UDim.new(0, 8)
+	mCorner.Parent = ui.main
 
 	ui.dragBar = Instance.new("TextButton")
 	ui.dragBar.Name = "DragBar"
@@ -992,7 +904,6 @@ local function buildUI()
 
 	ui.title = Instance.new("TextLabel")
 	ui.title.Size = UDim2.new(1, 0, 1, 0)
-	ui.title.Position = UDim2.new(0, 0, 0, 0)
 	ui.title.BackgroundTransparency = 1
 	ui.title.TextColor3 = C.text
 	ui.title.Font = Enum.Font.GothamBold
@@ -1028,14 +939,14 @@ local function buildUI()
 	ui.searchBox.Text = ""
 	ui.searchBox.Parent = ui.main
 
-	local searchPad = Instance.new("UIPadding")
-	searchPad.PaddingLeft = UDim.new(0, 8)
-	searchPad.PaddingRight = UDim.new(0, 8)
-	searchPad.Parent = ui.searchBox
+	local sPad = Instance.new("UIPadding")
+	sPad.PaddingLeft = UDim.new(0, 8)
+	sPad.PaddingRight = UDim.new(0, 8)
+	sPad.Parent = ui.searchBox
 
-	local searchCorner = Instance.new("UICorner")
-	searchCorner.CornerRadius = UDim.new(0, 5)
-	searchCorner.Parent = ui.searchBox
+	local sCorner = Instance.new("UICorner")
+	sCorner.CornerRadius = UDim.new(0, 5)
+	sCorner.Parent = ui.searchBox
 
 	ui.chips = {}
 	local chipDefs = {
@@ -1057,9 +968,9 @@ local function buildUI()
 		chip.Text = cdef.name
 		chip.Parent = ui.main
 
-		local cc = Instance.new("UICorner")
-		cc.CornerRadius = UDim.new(0, 5)
-		cc.Parent = chip
+		local cCorner = Instance.new("UICorner")
+		cCorner.CornerRadius = UDim.new(0, 5)
+		cCorner.Parent = chip
 
 		ui.chips[cdef.name] = chip
 	end
@@ -1074,14 +985,14 @@ local function buildUI()
 	ui.list.AutomaticCanvasSize = Enum.AutomaticSize.Y
 	ui.list.Parent = ui.main
 
-	local listCorner = Instance.new("UICorner")
-	listCorner.CornerRadius = UDim.new(0, 6)
-	listCorner.Parent = ui.list
+	local lCorner = Instance.new("UICorner")
+	lCorner.CornerRadius = UDim.new(0, 6)
+	lCorner.Parent = ui.list
 
-	local listLayout = Instance.new("UIListLayout")
-	listLayout.Padding = UDim.new(0, 4)
-	listLayout.SortOrder = Enum.SortOrder.LayoutOrder
-	listLayout.Parent = ui.list
+	local lLayout = Instance.new("UIListLayout")
+	lLayout.Padding = UDim.new(0, 4)
+	lLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	lLayout.Parent = ui.list
 
 	ui.details = Instance.new("TextBox")
 	ui.details.Size = UDim2.new(0, DET_W, 0, CONTENT_H - 58)
@@ -1096,17 +1007,17 @@ local function buildUI()
 	ui.details.TextWrapped = true
 	ui.details.TextEditable = false
 	ui.details.ClearTextOnFocus = false
-	ui.details.Text = "Select an item to inspect, or switch to Live Now."
+	ui.details.Text = "Select an item or switch to Live Now."
 	ui.details.Parent = ui.main
 
-	local detailPadding = Instance.new("UIPadding")
-	detailPadding.PaddingLeft = UDim.new(0, 8)
-	detailPadding.PaddingTop = UDim.new(0, 8)
-	detailPadding.Parent = ui.details
+	local dPad = Instance.new("UIPadding")
+	dPad.PaddingLeft = UDim.new(0, 8)
+	dPad.PaddingTop = UDim.new(0, 8)
+	dPad.Parent = ui.details
 
-	local detailCorner = Instance.new("UICorner")
-	detailCorner.CornerRadius = UDim.new(0, 6)
-	detailCorner.Parent = ui.details
+	local dCorner = Instance.new("UICorner")
+	dCorner.CornerRadius = UDim.new(0, 6)
+	dCorner.Parent = ui.details
 
 	ui.viewModeBtn = Instance.new("TextButton")
 	ui.viewModeBtn.Name = "ViewMode"
@@ -1120,9 +1031,9 @@ local function buildUI()
 	ui.viewModeBtn.Text = "View: Details"
 	ui.viewModeBtn.Parent = ui.main
 
-	local viewModeCorner = Instance.new("UICorner")
-	viewModeCorner.CornerRadius = UDim.new(0, 5)
-	viewModeCorner.Parent = ui.viewModeBtn
+	local vmCorner = Instance.new("UICorner")
+	vmCorner.CornerRadius = UDim.new(0, 5)
+	vmCorner.Parent = ui.viewModeBtn
 
 	ui.copyPathBtn = Instance.new("TextButton")
 	ui.copyPathBtn.Name = "CopyPath"
@@ -1136,9 +1047,9 @@ local function buildUI()
 	ui.copyPathBtn.Text = "Copy Selected Path"
 	ui.copyPathBtn.Parent = ui.main
 
-	local copyPathCorner = Instance.new("UICorner")
-	copyPathCorner.CornerRadius = UDim.new(0, 5)
-	copyPathCorner.Parent = ui.copyPathBtn
+	local cpCorner = Instance.new("UICorner")
+	cpCorner.CornerRadius = UDim.new(0, 5)
+	cpCorner.Parent = ui.copyPathBtn
 
 	ui.statusLabel = Instance.new("TextLabel")
 	ui.statusLabel.Size = UDim2.new(1, -20, 0, 20)
@@ -1151,7 +1062,7 @@ local function buildUI()
 	ui.statusLabel.Text = "Idle"
 	ui.statusLabel.Parent = ui.main
 
-	local buttons = {
+	local btnDefs = {
 		{ key = "scanBtn", label = "Scan", x = 10, y = H - 78, w = 115, bg = C.btn },
 		{ key = "clearBtn", label = "Clear", x = 135, y = H - 78, w = 115, bg = C.btn },
 		{ key = "clearLogBtn", label = "Clear Log", x = 260, y = H - 78, w = 115, bg = C.btn },
@@ -1159,31 +1070,31 @@ local function buildUI()
 		{ key = "copyBtn", label = "Copy Full Report", x = 10, y = H - 40, w = 240, bg = C.copyBtn },
 		{ key = "markBtn", label = "Mark Now", x = 260, y = H - 40, w = 250, bg = C.markBtn },
 	}
-	for _, def in ipairs(buttons) do
-		local button = Instance.new("TextButton")
-		button.Name = def.key
-		button.Size = UDim2.new(0, def.w, 0, 32)
-		button.Position = UDim2.new(0, def.x, 0, def.y)
-		button.BackgroundColor3 = def.bg
-		button.BorderSizePixel = 0
-		button.TextColor3 = C.text
-		button.Font = Enum.Font.SourceSansSemibold
-		button.TextSize = 13
-		button.Text = def.label
-		button.Parent = ui.main
+	for _, def in ipairs(btnDefs) do
+		local b = Instance.new("TextButton")
+		b.Name = def.key
+		b.Size = UDim2.new(0, def.w, 0, 32)
+		b.Position = UDim2.new(0, def.x, 0, def.y)
+		b.BackgroundColor3 = def.bg
+		b.BorderSizePixel = 0
+		b.TextColor3 = C.text
+		b.Font = Enum.Font.SourceSansSemibold
+		b.TextSize = 13
+		b.Text = def.label
+		b.Parent = ui.main
 
-		local corner = Instance.new("UICorner")
-		corner.CornerRadius = UDim.new(0, 5)
-		corner.Parent = button
+		local bCorner = Instance.new("UICorner")
+		bCorner.CornerRadius = UDim.new(0, 5)
+		bCorner.Parent = b
 
-		ui[def.key] = button
+		ui[def.key] = b
 	end
 
 	ui.visible = true
 	ui.selected = nil
 end
 
-local function bindDrag()
+local function bindDragBar()
 	if not ui.dragBar or not ui.main or not UserInputService then
 		return
 	end
@@ -1191,7 +1102,7 @@ local function bindDrag()
 	local dragStart = nil
 	local startPos = nil
 
-	trackGlobal(ui.dragBar.InputBegan:Connect(function(input)
+	trackConn(ui.dragBar.InputBegan:Connect(function(input)
 		if destroyed then
 			return
 		end
@@ -1202,7 +1113,7 @@ local function bindDrag()
 		end
 	end))
 
-	trackGlobal(UserInputService.InputChanged:Connect(function(input)
+	trackConn(UserInputService.InputChanged:Connect(function(input)
 		if destroyed or not dragging or not dragStart or not startPos then
 			return
 		end
@@ -1219,7 +1130,7 @@ local function bindDrag()
 		end
 	end))
 
-	trackGlobal(UserInputService.InputEnded:Connect(function(input)
+	trackConn(UserInputService.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			dragging = false
 			dragStart = nil
@@ -1228,117 +1139,123 @@ local function bindDrag()
 	end))
 end
 
-local function bindUI()
-	trackGlobal(ui.searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+local function bindInspectorEvents()
+	trackConn(ui.searchBox:GetPropertyChangedSignal("Text"):Connect(function()
 		if not destroyed then
 			searchQuery = tostring(ui.searchBox.Text or "")
-			applyFiltersToRows()
+			applyViewFilter()
 		end
 	end))
 
 	for chipName, chipBtn in pairs(ui.chips or {}) do
-		trackGlobal(chipBtn.Activated:Connect(function()
+		trackConn(chipBtn.Activated:Connect(function()
 			if not destroyed then
 				activeFilter = chipName
-				applyFiltersToRows()
-				updateStatus("Filter: " .. chipName)
+				applyViewFilter()
+				setStatus("Filter: " .. chipName)
 			end
 		end))
 	end
 
-	trackGlobal(ui.viewModeBtn.Activated:Connect(function()
+	trackConn(ui.viewModeBtn.Activated:Connect(function()
 		if destroyed then
 			return
 		end
 		rightViewMode = (rightViewMode == "Details") and "Live" or "Details"
 		ui.viewModeBtn.Text = (rightViewMode == "Details") and "View: Details" or "View: Live Now"
-		renderRightPanel()
+		renderRightBox()
 	end))
 
-	trackGlobal(ui.copyPathBtn.Activated:Connect(function()
+	trackConn(ui.copyPathBtn.Activated:Connect(function()
 		if destroyed then
 			return
 		end
 		if ui.selected and ui.selected.info and ui.selected.info.fullName then
-			local pathStr = ui.selected.info.fullName
-			local ok = copyToClipboard(pathStr)
-			updateStatus(ok and ("Path copied: " .. pathStr) or ("Path: " .. pathStr))
+			local p = ui.selected.info.fullName
+			local ok = setClipboardSafe(p)
+			setStatus(ok and ("Path copied: " .. p) or ("Path: " .. p))
 		else
-			updateStatus("No item selected")
+			setStatus("No item selected")
 		end
 	end))
 
-	trackGlobal(ui.markBtn.Activated:Connect(function()
-		if not destroyed then
-			markCurrentMoment()
-			updateCounts()
-			updateStatus("Marked Now #" .. tostring(markCounter) .. " - perform action in-game")
-		end
-	end))
-
-	trackGlobal(ui.scanBtn.Activated:Connect(function()
-		if not destroyed then
-			startScan()
-		end
-	end))
-
-	trackGlobal(ui.clearBtn.Activated:Connect(function()
-		if not destroyed then
-			clearEntries()
-			updateStatus("Cleared list (Log & Live kept)")
-		end
-	end))
-
-	trackGlobal(ui.clearLogBtn.Activated:Connect(function()
-		if not destroyed then
-			clearLogs()
-			updateStatus("Cleared User Log & Live Events")
-		end
-	end))
-
-	trackGlobal(ui.copyBtn.Activated:Connect(function()
+	trackConn(ui.markBtn.Activated:Connect(function()
 		if destroyed then
 			return
 		end
-		local reportText, matchedCount = collectSystemReport()
-		local copied = copyToClipboard(reportText)
-		local savedFile = saveReportFile(reportText)
-		printReportChunks(reportText)
+		markCounter += 1
+		liveEvents = {}
+		liveEventSeen = {}
+		rightViewMode = "Live"
+		if ui.viewModeBtn then
+			pcall(function()
+				ui.viewModeBtn.Text = "View: Live Now"
+			end)
+		end
+		renderRightBox()
+		applyViewFilter()
+		setStatus("Marked Now #" .. tostring(markCounter))
+	end))
 
+	trackConn(ui.scanBtn.Activated:Connect(function()
+		if not destroyed then
+			runScan()
+		end
+	end))
+
+	trackConn(ui.clearBtn.Activated:Connect(function()
+		if not destroyed then
+			clearListEntries()
+			setStatus("Cleared list")
+		end
+	end))
+
+	trackConn(ui.clearLogBtn.Activated:Connect(function()
+		if not destroyed then
+			clearLogsData()
+			setStatus("Cleared Log & Live")
+		end
+	end))
+
+	trackConn(ui.copyBtn.Activated:Connect(function()
+		if destroyed then
+			return
+		end
+		local reportText, matched = buildFullReport()
+		local copied = setClipboardSafe(reportText)
+		printChunksSafe(reportText)
 		if copied then
-			updateStatus("Report copied (" .. matchedCount .. " items)")
-		elseif savedFile then
-			updateStatus("Saved inspector_report.txt + printed to Output")
+			setStatus("Report copied (" .. tostring(matched) .. " items)")
 		else
 			pcall(function()
 				ui.details.Text = reportText
 			end)
-			updateStatus("Printed to Output + shown in Details box")
+			setStatus("Printed to Output + shown in Details box")
 		end
 	end))
 
-	trackGlobal(ui.closeBtn.Activated:Connect(function()
-		destroy()
+	trackConn(ui.closeBtn.Activated:Connect(function()
+		cleanupInspector()
 	end))
 
-	trackGlobal(ui.toggleBtn.Activated:Connect(function()
+	trackConn(ui.toggleBtn.Activated:Connect(function()
 		if not destroyed then
-			setVisible(not ui.visible)
+			setGuiVisible(not ui.visible)
 		end
 	end))
 
-	trackGlobal(ui.screenGui.AncestryChanged:Connect(function(_, parent)
+	trackConn(ui.screenGui.AncestryChanged:Connect(function(_, parent)
 		if parent == nil and not destroyed then
-			destroy()
+			cleanupInspector()
 		end
 	end))
 
-	trackGlobal(game.DescendantAdded:Connect(function(inst)
+	trackConn(game.DescendantAdded:Connect(function(inst)
 		if destroyed or entryCount >= MAX_ENTRIES then
 			return
 		end
 		task.defer(function()
-			if destroyed or isSelf(inst) or entryCount >= MAX_ENTRIES then
+			if destroyed or isOwnGui(inst) or entryCount >= MAX_ENTRIES then
 				return
 			end
 			if not pcall(function()
@@ -1346,95 +1263,89 @@ local function bindUI()
 			end) then
 				return
 			end
-			if keywordWeight(inst) > 0 then
-				recordLiveEvent(inst, "added")
-				updateCounts()
+			if targetWeight(inst) > 0 then
+				pushLiveEvent(inst, "added")
+				applyViewFilter()
 			end
-			if score(inst) >= MIN_SCORE then
-				addEntry(inst)
+			if scoreInst(inst) >= MIN_SCORE then
+				insertEntry(inst)
 			end
 		end)
 	end))
 
-	trackGlobal(game.DescendantRemoving:Connect(function(inst)
+	trackConn(game.DescendantRemoving:Connect(function(inst)
 		if destroyed then
 			return
 		end
 		removeEntry(inst)
 	end))
 
-	bindDrag()
+	bindDragBar()
 end
 
-local previous = safe(function()
+local previousGuard = safeCall(function()
 	return _G[GUARD_KEY]
 end)
-if type(previous) == "table" and type(previous.destroy) == "function" then
-	pcall(previous.destroy)
+if type(previousGuard) == "table" and type(previousGuard.destroy) == "function" then
+	pcall(previousGuard.destroy)
 end
 
 pcall(function()
 	if type(_G) == "table" then
-		_G[GUARD_KEY] = { destroy = destroy }
+		_G[GUARD_KEY] = { destroy = cleanupInspector }
 	end
 end)
 
 task.defer(function()
-	local container, source = safe(function()
+	local parent, mountSrc = safeCall(function()
 		if typeof(gethui) == "function" then
-			local success, hui = pcall(gethui)
-			if success and typeof(hui) == "Instance" then
-				return hui, "gethui"
+			local okH, h = pcall(gethui)
+			if okH and typeof(h) == "Instance" then
+				return h, "gethui"
 			end
 		end
 		return nil, nil
 	end)
 
-	if not container then
-		local okCore, core = pcall(function()
-			return CoreGui
-		end)
-		if okCore and typeof(core) == "Instance" then
-			container, source = core, "CoreGui"
-		end
+	if not parent and CoreGui then
+		parent, mountSrc = CoreGui, "CoreGui"
 	end
 
-	if not container then
-		local okPlayerGui, playerGui = pcall(function()
-			local localPlayer = Players and Players.LocalPlayer
-			if localPlayer then
-				return localPlayer:WaitForChild("PlayerGui", 5)
+	if not parent and Players then
+		local lp = Players.LocalPlayer
+		if lp then
+			local pg = safeCall(function()
+				return lp:WaitForChild("PlayerGui", 5)
+			end)
+			if typeof(pg) == "Instance" then
+				parent, mountSrc = pg, "PlayerGui"
 			end
-			return nil
-		end)
-		if okPlayerGui and typeof(playerGui) == "Instance" then
-			container, source = playerGui, "PlayerGui"
 		end
 	end
 
-	if not container then
+	if not parent then
 		return
 	end
 
 	pcall(function()
-		for _, child in ipairs(container:GetChildren()) do
-			if child:IsA("ScreenGui") and child.Name == GUI_TAG then
-				child:Destroy()
+		for _, ch in ipairs(parent:GetChildren()) do
+			if ch:IsA("ScreenGui") and ch.Name == GUI_TAG then
+				ch:Destroy()
 			end
 		end
 	end)
 
-	buildUI()
-	bindUI()
+	buildInspectorUI()
+	bindInspectorEvents()
 
 	local okParent = pcall(function()
-		ui.screenGui.Parent = container
+		ui.screenGui.Parent = parent
 	end)
 	if not okParent then
-		destroy()
+		cleanupInspector()
 		return
 	end
 
-	updateStatus("Mounted via " .. tostring(source) .. " - press Scan or Mark Now")
-	startScan()
+	setStatus("Ready (" .. tostring(mountSrc) .. ")")
+	runScan()
 end)
