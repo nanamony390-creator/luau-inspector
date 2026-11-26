@@ -614,7 +614,7 @@ local function buildUI()
 	ui.list.BorderSizePixel = 0
 	ui.list.ScrollBarThickness = 6
 	ui.list.CanvasSize = UDim2.new(0, 0, 0, 0)
-	ui.list.AutomaticCanvasSize = Enum.AutomaticCanvasSize.Y
+	ui.list.AutomaticCanvasSize = Enum.AutomaticSize.Y
 	ui.list.Parent = ui.main
 
 	local listCorner = Instance.new("UICorner")
