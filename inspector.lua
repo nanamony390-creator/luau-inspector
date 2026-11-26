@@ -13,15 +13,15 @@ local UserInputService = getServiceSafe("UserInputService")
 
 local GUI_TAG = "RuntimeInspector_7C1E9A"
 local GUARD_KEY = "__RuntimeInspectorGuard_" .. GUI_TAG
-local MAX_ENTRIES = 120
-local MAX_TARGET_HITS = 350
-local MAX_LIVE_EVENTS = 120
+local MAX_ENTRIES = 140
+local MAX_TARGET_HITS = 500
+local MAX_LIVE_EVENTS = 160
 local SCAN_BATCH = 80
 local MIN_SCORE = 2
 
-local W, H = 520, 580
+local W, H = 530, 585
 local LIST_W = 302
-local DET_X, DET_W = 322, 188
+local DET_X, DET_W = 322, 198
 local TOP = 76
 local BOTTOM_H = 116
 local CONTENT_H = H - TOP - BOTTOM_H
@@ -42,6 +42,8 @@ local searchQuery = ""
 local rightViewMode = "Details"
 local scanToken = 0
 local destroyed = false
+local spyActive = false
+local oldNamecall = nil
 local ui = {}
 
 local C = {
@@ -61,6 +63,7 @@ local TARGET_KEYWORDS = {
 	"trait", "reroll", "roll", "potential", "stat", "cube", "token",
 	"rollback", "undo", "revert", "rejoin", "state", "save", "data",
 	"remote", "event", "function", "bindable", "unit", "equip",
+	"trade", "setting", "config", "profile", "pet", "endpoint",
 }
 
 local VALUE_PROPS = {
@@ -174,27 +177,40 @@ local function isOwnGui(inst)
 	return ok and res or false
 end
 
-local function fmtVal(val)
+local function serializeArg(val, depth)
+	depth = depth or 0
+	if depth > 2 then
+		return "{...}"
+	end
 	local t = typeof(val)
 	if t == "nil" then
 		return "nil"
 	elseif t == "string" then
-		return "\"" .. string.sub(val, 1, 100) .. "\""
+		return "\"" .. string.sub(val, 1, 90) .. "\""
 	elseif t == "number" or t == "boolean" then
 		return tostring(val)
-	elseif t == "Vector3" then
-		return string.format("(%.2f, %.2f, %.2f)", val.X, val.Y, val.Z)
-	elseif t == "CFrame" then
-		local p = val.Position
-		return string.format("CF(%.2f, %.2f, %.2f)", p.X, p.Y, p.Z)
-	elseif t == "Color3" then
-		return string.format("RGB(%.0f, %.0f, %.0f)", val.R * 255, val.G * 255, val.B * 255)
 	elseif t == "Instance" then
 		return fullPathSafe(val)
+	elseif t == "Vector3" then
+		return string.format("(%.1f,%.1f,%.1f)", val.X, val.Y, val.Z)
 	elseif t == "table" then
-		return "table"
+		local parts = {}
+		local count = 0
+		for k, v in pairs(val) do
+			count += 1
+			if count > 8 then
+				parts[#parts + 1] = "..."
+				break
+			end
+			parts[#parts + 1] = tostring(k) .. "=" .. serializeArg(v, depth + 1)
+		end
+		return "{" .. table.concat(parts, ", ") .. "}"
 	end
 	return tostring(val)
+end
+
+local function fmtVal(val)
+	return serializeArg(val, 0)
 end
 
 local function pairsSorted(tbl)
@@ -242,6 +258,9 @@ local function targetWeight(inst)
 	local nameL = string.lower(tostring(propSafe(inst, "Name") or ""))
 	local pathL = string.lower(fullPathSafe(inst))
 	local w = 0
+	if string.find(pathL, "endpoints", 1, true) then
+		w += 10
+	end
 	for _, kw in ipairs(TARGET_KEYWORDS) do
 		if string.find(nameL, kw, 1, true) then
 			w += 5
@@ -284,7 +303,7 @@ local function scoreInst(inst)
 	end
 	local s = targetWeight(inst)
 	if isRemoteKind(cls) then
-		s += 7
+		s += 8
 	end
 	if cls == "ModuleScript" then
 		s += 4
@@ -292,20 +311,11 @@ local function scoreInst(inst)
 	if next(attrsSafe(inst)) ~= nil then
 		s += 4
 	end
-	if isClass(inst, "Humanoid") then
-		s += 5
-	end
-	if isClass(inst, "Model") and propSafe(inst, "PrimaryPart") then
-		s += 2
-	end
 	if isValueKind(cls) or isClass(inst, "ValueBase") then
 		s += 3
 	end
 	if isClass(inst, "LayerCollector") then
 		s += 2
-	end
-	if cls == "Player" then
-		s += 3
 	end
 	local okTags, tags = pcall(function()
 		return CollectionService:GetTags(inst)
@@ -372,12 +382,12 @@ local function renderRightBox()
 	end
 	if rightViewMode == "Live" then
 		local lines = {
-			"=== LIVE NOW (Mark #" .. tostring(markCounter) .. ") ===",
-			"Events: " .. tostring(#liveEvents),
+			"=== LIVE NOW & REMOTE SPY (Mark #" .. tostring(markCounter) .. ") ===",
+			"Spy: " .. (spyActive and "ON" or "OFF") .. " | Events: " .. tostring(#liveEvents),
 			"",
 		}
 		if #liveEvents == 0 then
-			lines[#lines + 1] = "Waiting for changes after Mark Now..."
+			lines[#lines + 1] = "Perform action in-game (open/reroll/toggle) to capture calls & changes..."
 		else
 			for i = math.max(1, #liveEvents - 35), #liveEvents do
 				lines[#lines + 1] = liveEvents[i]
@@ -400,19 +410,12 @@ local function renderRightBox()
 	end
 end
 
-local function pushLiveEvent(inst, tagText)
-	if #liveEvents >= MAX_LIVE_EVENTS or isOwnGui(inst) then
+local function pushRawLiveLine(rawLine)
+	if destroyed or #liveEvents >= MAX_LIVE_EVENTS then
 		return
 	end
 	local prefix = (markCounter > 0) and ("[M" .. tostring(markCounter) .. "] ") or ""
-	local line = string.format(
-		"%s%s [%s] -> %s (%s)",
-		prefix,
-		tostring(propSafe(inst, "Name") or "?"),
-		tostring(propSafe(inst, "ClassName") or "?"),
-		fullPathSafe(inst),
-		tostring(tagText)
-	)
+	local line = prefix .. rawLine
 	if liveEventSeen[line] then
 		return
 	end
@@ -421,6 +424,20 @@ local function pushLiveEvent(inst, tagText)
 	if rightViewMode == "Live" then
 		renderRightBox()
 	end
+end
+
+local function pushLiveEvent(inst, tagText)
+	if isOwnGui(inst) then
+		return
+	end
+	local line = string.format(
+		"%s [%s] -> %s (%s)",
+		tostring(propSafe(inst, "Name") or "?"),
+		tostring(propSafe(inst, "ClassName") or "?"),
+		fullPathSafe(inst),
+		tostring(tagText)
+	)
+	pushRawLiveLine(line)
 end
 
 local function pushInspected(info)
@@ -683,15 +700,89 @@ local function clearLogsData()
 	applyViewFilter()
 end
 
+local function setupRemoteSpy()
+	local hookMeta = findExecutorFn("hookmetamethod")
+	local getMethod = findExecutorFn("getnamecallmethod")
+	local checkCaller = findExecutorFn("checkcaller")
+	if type(hookMeta) ~= "function" or type(getMethod) ~= "function" then
+		return false
+	end
+
+	local okHook, prev = pcall(function()
+		return hookMeta(game, "__namecall", function(self, ...)
+			local method = getMethod()
+			local fromCaller = (type(checkCaller) == "function") and checkCaller() or false
+			if not destroyed and not fromCaller and (method == "InvokeServer" or method == "FireServer") then
+				if typeof(self) == "Instance" and not isOwnGui(self) then
+					local args = { ... }
+					local argStrs = {}
+					for i = 1, math.min(#args, 6) do
+						argStrs[#argStrs + 1] = serializeArg(args[i], 0)
+					end
+					local callLine = string.format(
+						"[CALL:%s] %s(%s)",
+						tostring(method),
+						fullPathSafe(self),
+						table.concat(argStrs, ", ")
+					)
+					task.defer(function()
+						pushRawLiveLine(callLine)
+						applyViewFilter()
+					end)
+				end
+			end
+			return oldNamecall(self, ...)
+		end)
+	end)
+
+	if okHook and type(prev) == "function" then
+		oldNamecall = prev
+		spyActive = true
+		return true
+	end
+	return false
+end
+
 local function buildFullReport()
 	local out = {
-		"=== RUNTIME INSPECTOR REPORT ===",
-		"Target Scope: Trait Reroll / Stats & Potential Reroll / Rollback & State / Remotes",
-		"Mark #" .. tostring(markCounter) .. " | Inspected: " .. tostring(#inspectedHistory) .. " | Live: " .. tostring(#liveEvents),
+		"=== RUNTIME INSPECTOR ROLLBACK ARCHITECTURE REPORT ===",
+		"Target Scope: Trait Reroll / Stats & Potential Reroll / Rollback & State / Endpoints",
+		"Mark #" .. tostring(markCounter) .. " | RemoteSpy: " .. (spyActive and "ON" or "OFF") .. " | Inspected: " .. tostring(#inspectedHistory) .. " | Live: " .. tostring(#liveEvents),
 		"",
-		"--- [1] USER INSPECTED ---",
+		"--- [1] ALL ENDPOINTS (COMPLETE CLIENT <-> SERVER MAP) ---",
 	}
 
+	local endpointsFolder = ReplicatedStorage and ReplicatedStorage:FindFirstChild("endpoints")
+	if endpointsFolder then
+		local epList = endpointsFolder:GetDescendants()
+		table.sort(epList, function(a, b)
+			return fullPathSafe(a) < fullPathSafe(b)
+		end)
+		local epCount = 0
+		for _, ep in ipairs(epList) do
+			local cls = propSafe(ep, "ClassName")
+			if isRemoteKind(cls) then
+				epCount += 1
+				out[#out + 1] = string.format("• [%s] %s", tostring(cls), fullPathSafe(ep))
+			end
+		end
+		out[#out + 1] = "Total Endpoints Found: " .. tostring(epCount)
+	else
+		out[#out + 1] = "(ReplicatedStorage.endpoints not found)"
+	end
+
+	out[#out + 1] = ""
+	out[#out + 1] = "--- [2] LIVE NOW & REMOTE CALLS ---"
+	if #liveEvents == 0 then
+		out[#out + 1] = "(None)"
+	else
+		for _, line in ipairs(liveEvents) do
+			out[#out + 1] = line
+		end
+	end
+
+	out[#out + 1] = ""
+	out[#out + 1] = "--- [3] USER INSPECTED ---"
 	if #inspectedHistory == 0 then
 		out[#out + 1] = "(None)"
 	else
@@ -702,17 +793,7 @@ local function buildFullReport()
 	end
 
 	out[#out + 1] = ""
-	out[#out + 1] = "--- [2] LIVE NOW EVENTS ---"
-	if #liveEvents == 0 then
-		out[#out + 1] = "(None)"
-	else
-		for _, line in ipairs(liveEvents) do
-			out[#out + 1] = line
-		end
-	end
-
-	out[#out + 1] = ""
-	out[#out + 1] = "--- [3] SYSTEM CANDIDATES (REMOTES / MODULES / VALUES / TRAIT / REROLL / STATE) ---"
+	out[#out + 1] = "--- [4] MATCHED SYSTEM CANDIDATES ---"
 
 	local roots = {}
 	if ReplicatedStorage then
@@ -806,7 +887,7 @@ local function runScan()
 			task.wait()
 		end
 		if not destroyed and token == scanToken then
-			setStatus(string.format("Done - %d shown", entryCount))
+			setStatus(string.format("Done - %d shown | Spy: %s", entryCount, spyActive and "ON" or "OFF"))
 		end
 	end)
 end
@@ -868,7 +949,7 @@ local function buildInspectorUI()
 	ui.toggleBtn = Instance.new("TextButton")
 	ui.toggleBtn.Name = "Toggle"
 	ui.toggleBtn.Size = UDim2.new(0, 86, 0, 26)
-	ui.toggleBtn.Position = UDim2.new(0, 20, 0, 610)
+	ui.toggleBtn.Position = UDim2.new(0, 20, 0, 615)
 	ui.toggleBtn.BackgroundColor3 = C.btn
 	ui.toggleBtn.BorderSizePixel = 0
 	ui.toggleBtn.TextColor3 = C.text
@@ -931,7 +1012,7 @@ local function buildInspectorUI()
 	ui.searchBox.BorderSizePixel = 0
 	ui.searchBox.TextColor3 = C.text
 	ui.searchBox.PlaceholderColor3 = C.dim
-	ui.searchBox.PlaceholderText = "Search trait, reroll, stat, remote, path..."
+	ui.searchBox.PlaceholderText = "Search endpoints, trait, reroll, stat, path..."
 	ui.searchBox.Font = Enum.Font.SourceSans
 	ui.searchBox.TextSize = 13
 	ui.searchBox.TextXAlignment = Enum.TextXAlignment.Left
@@ -950,10 +1031,10 @@ local function buildInspectorUI()
 
 	ui.chips = {}
 	local chipDefs = {
-		{ name = "All", x = 322, w = 32 },
-		{ name = "Target", x = 357, w = 44 },
-		{ name = "Remotes", x = 404, w = 52 },
-		{ name = "Modules", x = 459, w = 51 },
+		{ name = "All", x = 322, w = 34 },
+		{ name = "Target", x = 359, w = 46 },
+		{ name = "Remotes", x = 408, w = 54 },
+		{ name = "Modules", x = 465, w = 55 },
 	}
 	for _, cdef in ipairs(chipDefs) do
 		local chip = Instance.new("TextButton")
@@ -1063,12 +1144,12 @@ local function buildInspectorUI()
 	ui.statusLabel.Parent = ui.main
 
 	local btnDefs = {
-		{ key = "scanBtn", label = "Scan", x = 10, y = H - 78, w = 115, bg = C.btn },
-		{ key = "clearBtn", label = "Clear", x = 135, y = H - 78, w = 115, bg = C.btn },
-		{ key = "clearLogBtn", label = "Clear Log", x = 260, y = H - 78, w = 115, bg = C.btn },
-		{ key = "closeBtn", label = "Close", x = 385, y = H - 78, w = 125, bg = C.btn },
-		{ key = "copyBtn", label = "Copy Full Report", x = 10, y = H - 40, w = 240, bg = C.copyBtn },
-		{ key = "markBtn", label = "Mark Now", x = 260, y = H - 40, w = 250, bg = C.markBtn },
+		{ key = "scanBtn", label = "Scan", x = 10, y = H - 78, w = 118, bg = C.btn },
+		{ key = "clearBtn", label = "Clear", x = 138, y = H - 78, w = 118, bg = C.btn },
+		{ key = "clearLogBtn", label = "Clear Log", x = 266, y = H - 78, w = 118, bg = C.btn },
+		{ key = "closeBtn", label = "Close", x = 394, y = H - 78, w = 126, bg = C.btn },
+		{ key = "copyBtn", label = "Copy Full Report", x = 10, y = H - 40, w = 246, bg = C.copyBtn },
+		{ key = "markBtn", label = "Mark Now", x = 266, y = H - 40, w = 254, bg = C.markBtn },
 	}
 	for _, def in ipairs(btnDefs) do
 		local b = Instance.new("TextButton")
@@ -1335,6 +1416,7 @@ task.defer(function()
 		end
 	end)
 
+	setupRemoteSpy()
 	buildInspectorUI()
 	bindInspectorEvents()
 
@@ -1346,6 +1428,6 @@ task.defer(function()
 		return
 	end
 
-	setStatus("Ready (" .. tostring(mountSrc) .. ")")
+	setStatus("Ready (" .. tostring(mountSrc) .. ") | Spy: " .. (spyActive and "ON" or "OFF"))
 	runScan()
 end)
