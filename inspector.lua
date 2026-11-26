@@ -6,6 +6,7 @@ local function service(name)
 end
 
 local Players = service("Players")
+local ReplicatedStorage = service("ReplicatedStorage")
 local CoreGui = service("CoreGui")
 local CollectionService = service("CollectionService")
 local UserInputService = service("UserInputService")
@@ -13,19 +14,22 @@ local UserInputService = service("UserInputService")
 local GUI_TAG = "RuntimeInspector_7C1E9A"
 local GUARD_KEY = "__RuntimeInspectorGuard_" .. GUI_TAG
 local MAX_ENTRIES = 60
-local SCAN_BATCH = 40
+local MAX_TARGET_HITS = 250
+local SCAN_BATCH = 60
 local MIN_SCORE = 2
 
-local W, H = 460, 520
-local LIST_W = 268
-local DET_X, DET_W = 288, 162
+local W, H = 480, 530
+local LIST_W = 278
+local DET_X, DET_W = 298, 172
 local TOP = 42
-local BOTTOM_H = 76
+local BOTTOM_H = 112
 local CONTENT_H = H - TOP - BOTTOM_H
 
 local connections = {}
 local entries = {}
 local entryCount = 0
+local inspectedHistory = {}
+local inspectedSeen = {}
 local scanToken = 0
 local destroyed = false
 local ui = {}
@@ -39,6 +43,12 @@ local C = {
 	text = Color3.fromRGB(224, 230, 240),
 	dim = Color3.fromRGB(150, 158, 172),
 	btn = Color3.fromRGB(52, 58, 72),
+}
+
+local TARGET_KEYWORDS = {
+	"trait", "reroll", "roll", "potential", "stat", "cube", "token",
+	"rollback", "undo", "revert", "state", "save", "data", "remote",
+	"event", "function", "party", "invite", "trade", "gift", "equip",
 }
 
 local VALUE_PROPS = {
@@ -57,6 +67,30 @@ local SKIP_CLASSES = {
 	UIPadding = true, UISizeConstraint = true,
 	UIAspectRatioConstraint = true, UIStroke = true,
 }
+
+local function getEnv()
+	local okG, g = pcall(function()
+		local fn = _G and _G["getgenv"]
+		if type(fn) == "function" then
+			return fn()
+		end
+		return nil
+	end)
+	if okG and type(g) == "table" then
+		return g
+	end
+	return _G
+end
+
+local function copyToClipboard(text)
+	local env = getEnv()
+	local fn = (env and env["setclipboard"]) or (env and env["toclipboard"])
+	if type(fn) == "function" then
+		local ok = pcall(fn, text)
+		return ok
+	end
+	return false
+end
 
 local function trackGlobal(conn)
 	if conn then
@@ -181,6 +215,45 @@ local function countKeys(t)
 	return count
 end
 
+local function matchesTargetKeyword(inst)
+	local nameLower = string.lower(tostring(readProp(inst, "Name") or ""))
+	local pathLower = string.lower(getFullName(inst))
+	for _, kw in ipairs(TARGET_KEYWORDS) do
+		if string.find(nameLower, kw, 1, true) or string.find(pathLower, kw, 1, true) then
+			return true
+		end
+	end
+	for k in pairs(getAttributes(inst)) do
+		local keyLower = string.lower(tostring(k))
+		for _, kw in ipairs(TARGET_KEYWORDS) do
+			if string.find(keyLower, kw, 1, true) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function isSystemOrTargetCandidate(inst)
+	if isSelf(inst) then
+		return false
+	end
+	local className = readProp(inst, "ClassName")
+	if SKIP_CLASSES[className] then
+		return false
+	end
+	if isA(inst, "RemoteEvent")
+		or isA(inst, "RemoteFunction")
+		or isA(inst, "BindableEvent")
+		or isA(inst, "BindableFunction")
+		or isA(inst, "ModuleScript")
+		or isA(inst, "ValueBase")
+	then
+		return true
+	end
+	return matchesTargetKeyword(inst)
+end
+
 local function score(inst)
 	if isSelf(inst) then
 		return 0
@@ -190,6 +263,15 @@ local function score(inst)
 		return 0
 	end
 	local value = 0
+	if matchesTargetKeyword(inst) then
+		value += 6
+	end
+	if isA(inst, "RemoteEvent") or isA(inst, "RemoteFunction") then
+		value += 5
+	end
+	if isA(inst, "ModuleScript") then
+		value += 3
+	end
 	if next(getAttributes(inst)) ~= nil then
 		value += 4
 	end
@@ -249,6 +331,33 @@ local function buildInfo(inst)
 	return info
 end
 
+local function formatInfoBlock(info)
+	local lines = {
+		"Name: " .. info.name,
+		"Class: " .. info.className,
+		"Path: " .. info.fullName,
+		"DebugId: " .. info.debugId,
+		"Attributes (" .. countKeys(info.attrs) .. "):",
+	}
+	for key, value in sortedPairs(info.attrs) do
+		lines[#lines + 1] = "  " .. key .. " = " .. value
+	end
+	lines[#lines + 1] = "Properties:"
+	for key, value in sortedPairs(info.props) do
+		lines[#lines + 1] = "  " .. key .. " = " .. value
+	end
+	return table.concat(lines, "\n")
+end
+
+local function recordInspected(info)
+	local key = tostring(info.fullName) .. "|" .. tostring(info.debugId)
+	if inspectedSeen[key] then
+		return
+	end
+	inspectedSeen[key] = true
+	inspectedHistory[#inspectedHistory + 1] = info
+end
+
 local function refreshEntry(entry)
 	local row = entry.row
 	if not row then
@@ -275,6 +384,7 @@ local function selectEntry(entry)
 		refreshEntry(previous)
 	end
 	refreshEntry(entry)
+	recordInspected(entry.info)
 
 	local info = entry.info
 	local lines = {
@@ -350,7 +460,7 @@ local function updateCounts()
 		return
 	end
 	pcall(function()
-		ui.countLabel.Text = "Tracked: " .. entryCount
+		ui.countLabel.Text = "Tracked: " .. entryCount .. " | Log: " .. #inspectedHistory
 	end)
 end
 
@@ -454,6 +564,88 @@ local function clearEntries()
 	updateCounts()
 end
 
+local function collectSystemReport()
+	local sections = {
+		"=== RUNTIME INSPECTOR FULL SYSTEM REPORT ===",
+		"Target Scope: Trait Reroll / Stats & Potential Reroll / Rollback & State / Remotes",
+		"Inspected By User Count: " .. tostring(#inspectedHistory),
+		"",
+		"--- [1] USER INSPECTED ITEMS ---",
+	}
+
+	if #inspectedHistory == 0 then
+		sections[#sections + 1] = "(None clicked yet)"
+	else
+		for i, info in ipairs(inspectedHistory) do
+			sections[#sections + 1] = "[" .. i .. "] " .. formatInfoBlock(info)
+			sections[#sections + 1] = "----------------------------------------"
+		end
+	end
+
+	sections[#sections + 1] = ""
+	sections[#sections + 1] = "--- [2] MATCHED SYSTEM CANDIDATES (REMOTES / MODULES / VALUES / TRAIT / REROLL / STATE) ---"
+
+	local roots = {}
+	if ReplicatedStorage then
+		roots[#roots + 1] = ReplicatedStorage
+	end
+	local localPlayer = Players and Players.LocalPlayer
+	if localPlayer then
+		roots[#roots + 1] = localPlayer
+		local pg = safe(function()
+			return localPlayer:FindFirstChildOfClass("PlayerGui")
+		end)
+		if pg then
+			roots[#roots + 1] = pg
+		end
+	end
+
+	local matched = 0
+	local seenPaths = {}
+
+	for _, root in ipairs(roots) do
+		if matched >= MAX_TARGET_HITS then
+			break
+		end
+		local okDesc, desc = pcall(function()
+			return root:GetDescendants()
+		end)
+		if okDesc and type(desc) == "table" then
+			for _, inst in ipairs(desc) do
+				if matched >= MAX_TARGET_HITS then
+					break
+				end
+				if typeof(inst) == "Instance" and isSystemOrTargetCandidate(inst) then
+					local info = buildInfo(inst)
+					if not seenPaths[info.fullName] then
+						seenPaths[info.fullName] = true
+						matched += 1
+						sections[#sections + 1] = string.format(
+							"• %s [%s] -> %s",
+							info.name, info.className, info.fullName
+						)
+						if countKeys(info.attrs) > 0 then
+							for k, v in sortedPairs(info.attrs) do
+								sections[#sections + 1] = "    attr " .. k .. " = " .. v
+							end
+						end
+						if info.props.Value ~= nil then
+							sections[#sections + 1] = "    Value = " .. tostring(info.props.Value)
+						end
+						if info.props.Visible ~= nil then
+							sections[#sections + 1] = "    Visible = " .. tostring(info.props.Visible)
+						end
+					end
+				end
+			end
+		end
+	end
+
+	sections[#sections + 1] = ""
+	sections[#sections + 1] = "Total Matched System Items: " .. tostring(matched)
+	return table.concat(sections, "\n"), matched
+end
+
 local function startScan()
 	scanToken += 1
 	local token = scanToken
@@ -551,7 +743,7 @@ local function buildUI()
 	ui.toggleBtn = Instance.new("TextButton")
 	ui.toggleBtn.Name = "Toggle"
 	ui.toggleBtn.Size = UDim2.new(0, 86, 0, 26)
-	ui.toggleBtn.Position = UDim2.new(0, 20, 0, 550)
+	ui.toggleBtn.Position = UDim2.new(0, 20, 0, 560)
 	ui.toggleBtn.BackgroundColor3 = C.btn
 	ui.toggleBtn.BorderSizePixel = 0
 	ui.toggleBtn.TextColor3 = C.text
@@ -578,7 +770,7 @@ local function buildUI()
 
 	ui.dragBar = Instance.new("TextButton")
 	ui.dragBar.Name = "DragBar"
-	ui.dragBar.Size = UDim2.new(1, -156, 0, 32)
+	ui.dragBar.Size = UDim2.new(1, -180, 0, 32)
 	ui.dragBar.Position = UDim2.new(0, 10, 0, 6)
 	ui.dragBar.BackgroundTransparency = 1
 	ui.dragBar.Text = ""
@@ -597,14 +789,14 @@ local function buildUI()
 	ui.title.Parent = ui.dragBar
 
 	ui.countLabel = Instance.new("TextLabel")
-	ui.countLabel.Size = UDim2.new(0, 140, 0, 28)
-	ui.countLabel.Position = UDim2.new(1, -150, 0, 8)
+	ui.countLabel.Size = UDim2.new(0, 170, 0, 28)
+	ui.countLabel.Position = UDim2.new(1, -180, 0, 8)
 	ui.countLabel.BackgroundTransparency = 1
 	ui.countLabel.TextColor3 = C.dim
 	ui.countLabel.Font = Enum.Font.SourceSans
 	ui.countLabel.TextSize = 13
 	ui.countLabel.TextXAlignment = Enum.TextXAlignment.Right
-	ui.countLabel.Text = "Tracked: 0"
+	ui.countLabel.Text = "Tracked: 0 | Log: 0"
 	ui.countLabel.Parent = ui.main
 
 	ui.list = Instance.new("ScrollingFrame")
@@ -663,16 +855,17 @@ local function buildUI()
 	ui.statusLabel.Parent = ui.main
 
 	local buttons = {
-		{ key = "scanBtn", label = "Scan", x = 10 },
-		{ key = "clearBtn", label = "Clear", x = 120 },
-		{ key = "closeBtn", label = "Close", x = 230 },
+		{ key = "scanBtn", label = "Scan", x = 10, y = H - 78, w = 108 },
+		{ key = "clearBtn", label = "Clear", x = 128, y = H - 78, w = 108 },
+		{ key = "closeBtn", label = "Close", x = 246, y = H - 78, w = 108 },
+		{ key = "copyBtn", label = "Copy Report", x = 10, y = H - 40, w = 226 },
 	}
 	for _, def in ipairs(buttons) do
 		local button = Instance.new("TextButton")
 		button.Name = def.key
-		button.Size = UDim2.new(0, 100, 0, 32)
-		button.Position = UDim2.new(0, def.x, 0, H - 44)
-		button.BackgroundColor3 = C.btn
+		button.Size = UDim2.new(0, def.w, 0, 32)
+		button.Position = UDim2.new(0, def.x, 0, def.y)
+		button.BackgroundColor3 = (def.key == "copyBtn") and C.rowSelected or C.btn
 		button.BorderSizePixel = 0
 		button.TextColor3 = C.text
 		button.Font = Enum.Font.SourceSansSemibold
@@ -746,7 +939,23 @@ local function bindUI()
 	trackGlobal(ui.clearBtn.Activated:Connect(function()
 		if not destroyed then
 			clearEntries()
-			updateStatus("Cleared")
+			updateStatus("Cleared (User Log kept)")
+		end
+	end))
+
+	trackGlobal(ui.copyBtn.Activated:Connect(function()
+		if destroyed then
+			return
+		end
+		local reportText, matchedCount = collectSystemReport()
+		local copied = copyToClipboard(reportText)
+		if copied then
+			updateStatus("Report copied (" .. matchedCount .. " items + " .. #inspectedHistory .. " log)")
+		else
+			pcall(function()
+				ui.details.Text = reportText
+			end)
+			updateStatus("Clipboard unavailable - shown in Details box")
 		end
 	end))
 
