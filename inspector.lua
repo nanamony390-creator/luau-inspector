@@ -465,8 +465,9 @@ local function captureTargetSnapshot()
 		end
 	end
 
-	local prioritized = {}
-	local secondary = {}
+	local guiTarget = {}
+	local hiddenPets = {}
+	local otherTarget = {}
 
 	for _, root in ipairs(roots) do
 		local okD, desc = pcall(function()
@@ -491,10 +492,12 @@ local function captureTargetSnapshot()
 								vis = vis,
 								attrs = attrs,
 							}
-							if string.find(pathStr, "__HIDDEN_PETS", 1, true) or w >= 8 then
-								prioritized[#prioritized + 1] = item
-							elseif isValueKind(cls) or w >= 4 then
-								secondary[#secondary + 1] = item
+							if string.find(pathStr, "PlayerGui", 1, true) and w >= 5 then
+								guiTarget[#guiTarget + 1] = item
+							elseif string.find(pathStr, "__HIDDEN_PETS", 1, true) then
+								hiddenPets[#hiddenPets + 1] = item
+							elseif isValueKind(cls) or w >= 6 then
+								otherTarget[#otherTarget + 1] = item
 							end
 						end
 					end
@@ -504,12 +507,14 @@ local function captureTargetSnapshot()
 	end
 
 	local count = 0
-	local function appendGroup(list)
+	local function appendGroup(list, maxTake)
+		local taken = 0
 		for _, item in ipairs(list) do
-			if count >= 90 then
+			if count >= 90 or taken >= maxTake then
 				break
 			end
 			count += 1
+			taken += 1
 			lines[#lines + 1] = string.format("• %s [%s] -> %s", item.name, item.cls, item.path)
 			if item.val ~= nil then
 				lines[#lines + 1] = "    Value = " .. fmtVal(item.val)
@@ -523,10 +528,11 @@ local function captureTargetSnapshot()
 		end
 	end
 
-	appendGroup(prioritized)
-	appendGroup(secondary)
+	appendGroup(guiTarget, 35)
+	appendGroup(hiddenPets, 30)
+	appendGroup(otherTarget, 25)
 
-	lines[#lines + 1] = "Snapshot Items: " .. tostring(count) .. " (Prio:" .. tostring(#prioritized) .. " | Sec:" .. tostring(#secondary) .. ")"
+	lines[#lines + 1] = "Snapshot Items: " .. tostring(count) .. " (GUI:" .. tostring(#guiTarget) .. " | Pets:" .. tostring(#hiddenPets) .. " | Other:" .. tostring(#otherTarget) .. ")"
 	snapshotText = table.concat(lines, "\n")
 	rightViewMode = "Snapshot"
 	if ui.viewModeBtn then
