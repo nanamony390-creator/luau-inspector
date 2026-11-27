@@ -380,7 +380,7 @@ local function renderRightBox()
 		return
 	end
 	if rightViewMode == "Snapshot" then
-		local txt = (snapshotText ~= "") and snapshotText or "No snapshot taken yet. Click Snapshot to capture current target state."
+		local txt = (snapshotText ~= "") and snapshotText or "No snapshot taken yet. Click Snapshot State to capture current target state."
 		pcall(function()
 			ui.details.Text = txt
 		end)
@@ -465,7 +465,9 @@ local function captureTargetSnapshot()
 		end
 	end
 
-	local count = 0
+	local prioritized = {}
+	local secondary = {}
+
 	for _, root in ipairs(roots) do
 		local okD, desc = pcall(function()
 			return root:GetDescendants()
@@ -473,37 +475,58 @@ local function captureTargetSnapshot()
 		if okD and type(desc) == "table" then
 			for _, inst in ipairs(desc) do
 				if typeof(inst) == "Instance" and not isOwnGui(inst) then
-					local cls = propSafe(inst, "ClassName")
-					local w = targetWeight(inst)
-					if isValueKind(cls) or w >= 12 then
+					local pathStr = fullPathSafe(inst)
+					if not string.find(pathStr, "_FX_CACHE", 1, true) then
+						local cls = propSafe(inst, "ClassName")
+						local w = targetWeight(inst)
 						local attrs = attrsSafe(inst)
 						local val = isValueKind(cls) and propSafe(inst, "Value") or nil
 						local vis = propSafe(inst, "Visible")
 						if next(attrs) ~= nil or val ~= nil or vis ~= nil then
-							count += 1
-							lines[#lines + 1] = string.format("• %s [%s] -> %s", tostring(propSafe(inst, "Name") or "?"), tostring(cls), fullPathSafe(inst))
-							if val ~= nil then
-								lines[#lines + 1] = "    Value = " .. fmtVal(val)
-							end
-							if vis ~= nil then
-								lines[#lines + 1] = "    Visible = " .. tostring(vis)
-							end
-							for k, v in pairsSorted(attrs) do
-								lines[#lines + 1] = "    attr " .. k .. " = " .. fmtVal(v)
-							end
-							if count >= 90 then
-								break
+							local item = {
+								name = tostring(propSafe(inst, "Name") or "?"),
+								cls = tostring(cls),
+								path = pathStr,
+								val = val,
+								vis = vis,
+								attrs = attrs,
+							}
+							if string.find(pathStr, "__HIDDEN_PETS", 1, true) or w >= 8 then
+								prioritized[#prioritized + 1] = item
+							elseif isValueKind(cls) or w >= 4 then
+								secondary[#secondary + 1] = item
 							end
 						end
 					end
 				end
 			end
 		end
-		if count >= 90 then
-			break
+	end
+
+	local count = 0
+	local function appendGroup(list)
+		for _, item in ipairs(list) do
+			if count >= 90 then
+				break
+			end
+			count += 1
+			lines[#lines + 1] = string.format("• %s [%s] -> %s", item.name, item.cls, item.path)
+			if item.val ~= nil then
+				lines[#lines + 1] = "    Value = " .. fmtVal(item.val)
+			end
+			if item.vis ~= nil then
+				lines[#lines + 1] = "    Visible = " .. tostring(item.vis)
+			end
+			for k, v in pairsSorted(item.attrs) do
+				lines[#lines + 1] = "    attr " .. k .. " = " .. fmtVal(v)
+			end
 		end
 	end
-	lines[#lines + 1] = "Snapshot Items: " .. tostring(count)
+
+	appendGroup(prioritized)
+	appendGroup(secondary)
+
+	lines[#lines + 1] = "Snapshot Items: " .. tostring(count) .. " (Prio:" .. tostring(#prioritized) .. " | Sec:" .. tostring(#secondary) .. ")"
 	snapshotText = table.concat(lines, "\n")
 	rightViewMode = "Snapshot"
 	if ui.viewModeBtn then
