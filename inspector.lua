@@ -10,6 +10,7 @@ local ReplicatedStorage = getServiceSafe("ReplicatedStorage")
 local CoreGui = getServiceSafe("CoreGui")
 local CollectionService = getServiceSafe("CollectionService")
 local UserInputService = getServiceSafe("UserInputService")
+local TeleportService = getServiceSafe("TeleportService")
 
 local GUI_TAG = "RuntimeInspector_7C1E9A"
 local GUARD_KEY = "__RuntimeInspectorGuard_" .. GUI_TAG
@@ -49,6 +50,7 @@ local scanToken = 0
 local destroyed = false
 local safeCallsHooked = 0
 local hookedRemotes = {}
+local hookedRemotePaths = {}
 local ui = {}
 
 local C = {
@@ -69,8 +71,7 @@ local TARGET_KEYWORDS = {
 	"stat", "statreroll", "base_stats", "curse", "cube", "token", "quantity",
 	"rollback", "undo", "revert", "rejoin", "confirm", "activate",
 	"teleport", "session", "sync", "state", "save", "data", "store",
-	"remote", "event", "function", "bindable", "unit", "equip",
-	"setting", "config", "profile", "pet", "endpoint", "snapshot", "backup",
+	"unit", "equip", "profile", "pet", "endpoint", "snapshot", "backup",
 }
 
 local NOISE_PATH_PATTERNS = {
@@ -245,30 +246,43 @@ local function isRerollGuiPath(pathLower)
 		or string.find(pathLower, "reroll", 1, true) ~= nil
 end
 
-local function classifyPhase(textLower)
-	if string.find(textLower, "teleport", 1, true)
-		or string.find(textLower, "rejoin", 1, true)
-		or string.find(textLower, "rollback", 1, true)
-		or string.find(textLower, "revert", 1, true)
-		or string.find(textLower, "confirm", 1, true)
-		or string.find(textLower, "save", 1, true)
-		or string.find(textLower, "sync", 1, true)
-	then
-		return "SAVE/ROLLBACK"
+local function isActionableRerollControl(inst, pathLower)
+	if not isRerollGuiPath(pathLower) then
+		return false
 	end
-	if string.find(textLower, "[fn]", 1, true)
-		or string.find(textLower, "[ev]", 1, true)
-		or string.find(textLower, "reroll", 1, true)
-		or string.find(textLower, "trait", 1, true)
-		or string.find(textLower, "stat", 1, true)
+	local cls = propSafe(inst, "ClassName")
+	if cls == "TextButton" or cls == "ImageButton" or cls == "TextBox" then
+		return true
+	end
+	local nameL = string.lower(tostring(propSafe(inst, "Name") or ""))
+	return string.find(nameL, "quantity", 1, true) ~= nil
+		or string.find(nameL, "trait", 1, true) ~= nil
+		or string.find(nameL, "stat", 1, true) ~= nil
+		or string.find(nameL, "confirm", 1, true) ~= nil
+		or string.find(nameL, "roll", 1, true) ~= nil
+end
+
+local function classifyPhase(rawLineLower, pathLower)
+	if string.find(rawLineLower, "[fn]", 1, true)
+		or string.find(rawLineLower, "[ev]", 1, true)
 	then
 		return "REROLL/REMOTE"
 	end
-	if string.find(textLower, "attr:", 1, true)
-		or string.find(textLower, "value (", 1, true)
-		or string.find(textLower, "text (", 1, true)
+	if string.find(rawLineLower, "teleport", 1, true)
+		or string.find(rawLineLower, "rejoin", 1, true)
+		or string.find(rawLineLower, "rollback", 1, true)
+		or string.find(rawLineLower, "revert", 1, true)
+	then
+		return "FLOW/TELEPORT"
+	end
+	if string.find(rawLineLower, "attr:", 1, true)
+		or string.find(rawLineLower, "value (", 1, true)
+		or string.find(rawLineLower, "visible (", 1, true)
 	then
 		return "STATE/VAL"
+	end
+	if isRerollGuiPath(pathLower) then
+		return "REROLL/UI"
 	end
 	return "UI/NODE"
 end
@@ -562,7 +576,7 @@ local function pushRawLiveLine(rawLine, sourcePath)
 		return
 	end
 	local timing = formatTimingTag()
-	local phase = classifyPhase(string.lower(tostring(rawLine) .. " " .. tostring(sourcePath or "")))
+	local phase = classifyPhase(string.lower(tostring(rawLine)), string.lower(tostring(sourcePath or "")))
 	local prefix = (markCounter > 0) and ("[M" .. tostring(markCounter) .. "] ") or ""
 	local line = string.format("%s[%s] (%s) %s", prefix, phase, timing, tostring(rawLine))
 	if liveEventSeen[line] then
@@ -731,6 +745,7 @@ local function hookSingleRemoteSafe(remote)
 			end)
 			if okSet then
 				hookedRemotes[remote] = { fnProp = "InvokeServer", orig = origFn }
+				hookedRemotePaths[#hookedRemotePaths + 1] = string.format("[RemoteFunction] %s", rPath)
 				safeCallsHooked += 1
 			end
 		end
@@ -757,6 +772,7 @@ local function hookSingleRemoteSafe(remote)
 			end)
 			if okSet then
 				hookedRemotes[remote] = { fnProp = "FireServer", orig = origFn }
+				hookedRemotePaths[#hookedRemotePaths + 1] = string.format("[RemoteEvent] %s", rPath)
 				safeCallsHooked += 1
 			end
 		end
@@ -772,6 +788,7 @@ local function unhookAllRemotesSafe()
 		end
 	end
 	hookedRemotes = {}
+	hookedRemotePaths = {}
 	safeCallsHooked = 0
 end
 
@@ -1011,23 +1028,20 @@ local function insertEntry(inst)
 			end
 		end
 
-		if isClass(inst, "TextLabel") and isRerollGuiPath(pathL) then
-			local okTxt, txtSig = pcall(function()
-				return inst:GetPropertyChangedSignal("Text")
+		if isActionableRerollControl(inst, pathL) then
+			local okVis, visSig = pcall(function()
+				return inst:GetPropertyChangedSignal("Visible")
 			end)
-			if okTxt and txtSig then
-				entry.conns[#entry.conns + 1] = txtSig:Connect(function()
+			if okVis and visSig then
+				entry.conns[#entry.conns + 1] = visSig:Connect(function()
 					if destroyed or entries[inst] ~= entry then
 						return
 					end
-					local oldT = entry.info.props.Text or ""
-					local newT = tostring(propSafe(inst, "Text") or "")
-					if oldT ~= newT then
-						entry.info.props.Text = fmtVal(newT)
-						pushLiveEvent(inst, string.format("Text (%s -> %s)", fmtVal(oldT), fmtVal(newT)))
-						if ui.selected == entry and rightViewMode == "Details" then
-							renderRightBox()
-						end
+					local oldVis = tostring(entry.info.props.Visible or "nil")
+					local newVis = tostring(propSafe(inst, "Visible"))
+					if oldVis ~= newVis then
+						entry.info.props.Visible = newVis
+						pushLiveEvent(inst, string.format("Visible (%s -> %s)", oldVis, newVis))
 					end
 				end)
 			end
@@ -1115,11 +1129,22 @@ end
 local function buildFullReport()
 	local out = {
 		"=== RUNTIME INSPECTOR ROLLBACK ARCHITECTURE REPORT ===",
-		"Target Scope: Trait Reroll / Stat & Potential Reroll / Save & Rollback / Endpoints",
-		"Mark #" .. tostring(markCounter) .. " | HookedCalls: " .. tostring(safeCallsHooked) .. " | Inspected: " .. tostring(#inspectedHistory) .. " | Live: " .. tostring(#liveEvents),
+		"Target Scope: Reroll Mechanics / Remotes & Endpoints / State & Attributes / Rollback Flow",
+		"Mark #" .. tostring(markCounter) .. " | HookedRemotes: " .. tostring(safeCallsHooked) .. " | Inspected: " .. tostring(#inspectedHistory) .. " | Live: " .. tostring(#liveEvents),
 		"",
-		"--- [0] TOUCHED ENTITIES & PHASES ---",
+		"--- [0A] HOOKED REMOTES INVENTORY ---",
 	}
+
+	if #hookedRemotePaths == 0 then
+		out[#out + 1] = "(None)"
+	else
+		for i = 1, math.min(#hookedRemotePaths, 120) do
+			out[#out + 1] = "• " .. hookedRemotePaths[i]
+		end
+	end
+
+	out[#out + 1] = ""
+	out[#out + 1] = "--- [0B] TOUCHED ENTITIES & PHASES ---"
 
 	if #touchedOrder == 0 then
 		out[#out + 1] = "(None)"
@@ -1260,7 +1285,7 @@ local function runScan(targetedOnly)
 			task.wait()
 		end
 		if not destroyed and token == scanToken then
-			setStatus(string.format("Done - %d shown | Calls:%d", entryCount, safeCallsHooked))
+			setStatus(string.format("Done - %d shown | Remotes:%d", entryCount, safeCallsHooked))
 		end
 	end)
 end
@@ -1740,6 +1765,17 @@ local function bindInspectorEvents()
 		end
 	end))
 
+	if TeleportService then
+		trackConn(TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, message)
+			if not destroyed then
+				pushRawLiveLine(
+					string.format("TeleportInitFailed (%s: %s)", tostring(teleportResult), tostring(message)),
+					"TeleportService"
+				)
+			end
+		end))
+	end
+
 	trackConn(game.DescendantAdded:Connect(function(inst)
 		if destroyed or entryCount >= MAX_ENTRIES then
 			return
@@ -1765,7 +1801,7 @@ local function bindInspectorEvents()
 			if cls == "RemoteFunction" or cls == "RemoteEvent" then
 				hookSingleRemoteSafe(inst)
 			end
-			if targetWeight(inst) > 0 or isRerollGuiPath(pathL) then
+			if isRemoteKind(cls) or isValueKind(cls) or isActionableRerollControl(inst, pathL) then
 				pushLiveEvent(inst, "added")
 				applyViewFilter()
 			end
@@ -1778,6 +1814,9 @@ local function bindInspectorEvents()
 	trackConn(game.DescendantRemoving:Connect(function(inst)
 		if destroyed then
 			return
+		end
+		if isActionableRerollControl(inst, string.lower(fullPathSafe(inst))) then
+			pushLiveEvent(inst, "removed")
 		end
 		removeEntry(inst)
 	end))
@@ -1849,6 +1888,6 @@ task.defer(function()
 		return
 	end
 
-	setStatus("Ready (" .. tostring(mountSrc) .. ") | Calls:" .. tostring(safeCallsHooked))
+	setStatus("Ready (" .. tostring(mountSrc) .. ") | Remotes:" .. tostring(safeCallsHooked))
 	runScan(true)
 end)
