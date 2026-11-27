@@ -13,9 +13,9 @@ local UserInputService = getServiceSafe("UserInputService")
 
 local GUI_TAG = "RuntimeInspector_7C1E9A"
 local GUARD_KEY = "__RuntimeInspectorGuard_" .. GUI_TAG
-local MAX_ENTRIES = 120
-local MAX_TARGET_HITS = 400
-local MAX_LIVE_EVENTS = 160
+local MAX_ENTRIES = 140
+local MAX_TARGET_HITS = 450
+local MAX_LIVE_EVENTS = 180
 local SCAN_BATCH = 80
 local MIN_SCORE = 2
 
@@ -61,7 +61,8 @@ local C = {
 }
 
 local TARGET_KEYWORDS = {
-	"trait", "reroll", "roll", "potential", "stat", "cube", "token",
+	"trait", "traitreroll", "reroll", "roll", "potential",
+	"stat", "statreroll", "base_stats", "cube", "token",
 	"rollback", "undo", "revert", "rejoin", "state", "save", "data",
 	"remote", "event", "function", "bindable", "unit", "equip",
 	"setting", "config", "profile", "pet", "endpoint", "snapshot", "backup",
@@ -72,6 +73,10 @@ local NOISE_PATH_PATTERNS = {
 	"_eventleaderboard",
 	"tradinglist",
 	"partyinvitelist",
+	"giftinglist",
+	"experiencechat",
+	"chatwindow",
+	"_overhead",
 	"_fx_cache",
 }
 
@@ -84,9 +89,10 @@ local SKIP_CLASSES = {
 	Terrain = true, Camera = true, Decal = true, Texture = true,
 	Sky = true, Atmosphere = true, BloomEffect = true,
 	SunRaysEffect = true, DepthOfFieldEffect = true,
-	UIGradient = true, UICorner = true, UIListLayout = true,
+	UIGradient = true, UICorner = true, UIListLayout = true, UIGridLayout = true,
 	UIPadding = true, UISizeConstraint = true,
 	UIAspectRatioConstraint = true, UIStroke = true,
+	BillboardGui = true, SurfaceGui = true,
 	MeshPart = true, Part = true, UnionOperation = true, WedgePart = true, CornerWedgePart = true,
 	Weld = true, WeldConstraint = true, Motor6D = true, Attachment = true,
 	ParticleEmitter = true, Beam = true, Trail = true, Light = true, PointLight = true, SpotLight = true, SurfaceLight = true,
@@ -165,6 +171,16 @@ local function fullPathSafe(inst)
 	return tostring(propSafe(inst, "Name") or "?")
 end
 
+local function parentPathSafe(inst)
+	local okP, par = pcall(function()
+		return inst.Parent
+	end)
+	if okP and typeof(par) == "Instance" then
+		return fullPathSafe(par)
+	end
+	return "nil"
+end
+
 local function attrsSafe(inst)
 	local ok, attrs = pcall(function()
 		return inst:GetAttributes()
@@ -209,6 +225,15 @@ local function isNoisePath(pathLower)
 		end
 	end
 	return false
+end
+
+local function isRerollGuiPath(pathLower)
+	if not pathLower or pathLower == "" then
+		return false
+	end
+	return string.find(pathLower, "statreroll", 1, true) ~= nil
+		or string.find(pathLower, "traitreroll", 1, true) ~= nil
+		or string.find(pathLower, "reroll", 1, true) ~= nil
 end
 
 local function serializeArg(val, depth)
@@ -289,7 +314,8 @@ local function isValueKind(className)
 end
 
 local function targetWeight(inst)
-	local pathL = string.lower(fullPathSafe(inst))
+	local pathStr = fullPathSafe(inst)
+	local pathL = string.lower(pathStr)
 	if isNoisePath(pathL) then
 		return 0
 	end
@@ -297,6 +323,9 @@ local function targetWeight(inst)
 	local w = 0
 	if string.find(pathL, "endpoints", 1, true) then
 		w += 10
+	end
+	if isRerollGuiPath(pathL) then
+		w += 8
 	end
 	if string.find(nameL, "reroll", 1, true) or string.find(nameL, "rollback", 1, true) then
 		w += 6
@@ -331,7 +360,7 @@ local function isTargetCandidate(inst)
 	if isNoisePath(pathL) then
 		return false
 	end
-	if isRemoteKind(cls) or cls == "ModuleScript" or isValueKind(cls) then
+	if isRemoteKind(cls) or cls == "ModuleScript" or isValueKind(cls) or isRerollGuiPath(pathL) then
 		return true
 	end
 	return targetWeight(inst) > 0
@@ -376,6 +405,7 @@ local function buildInstInfo(inst)
 		name = tostring(propSafe(inst, "Name") or "?"),
 		className = tostring(propSafe(inst, "ClassName") or "?"),
 		fullName = fullPathSafe(inst),
+		parentPath = parentPathSafe(inst),
 		debugId = debugIdSafe(inst),
 		weight = targetWeight(inst),
 		attrs = {},
@@ -400,6 +430,7 @@ local function formatInfoText(info)
 		"Name: " .. info.name,
 		"Class: " .. info.className,
 		"Path: " .. info.fullName,
+		"Parent: " .. info.parentPath,
 		"DebugId: " .. info.debugId,
 		"Attributes (" .. keyCount(info.attrs) .. "):",
 	}
@@ -519,7 +550,7 @@ local function captureTargetSnapshot()
 		end
 	end
 
-	local guiTarget = {}
+	local rerollGui = {}
 	local hiddenPets = {}
 	local otherTarget = {}
 
@@ -532,23 +563,26 @@ local function captureTargetSnapshot()
 				if typeof(inst) == "Instance" and not isOwnGui(inst) then
 					local cls = propSafe(inst, "ClassName")
 					local pathStr = fullPathSafe(inst)
-					if not SKIP_CLASSES[cls] and not isNoisePath(string.lower(pathStr)) then
+					local pathL = string.lower(pathStr)
+					if not SKIP_CLASSES[cls] and not isNoisePath(pathL) then
 						local w = targetWeight(inst)
 						local attrs = attrsSafe(inst)
 						local val = isValueKind(cls) and propSafe(inst, "Value") or nil
+						local txt = isClass(inst, "TextLabel") and propSafe(inst, "Text") or nil
 						local vis = propSafe(inst, "Visible")
-						if next(attrs) ~= nil or val ~= nil or vis ~= nil then
+						if next(attrs) ~= nil or val ~= nil or txt ~= nil or vis ~= nil then
 							local item = {
 								name = tostring(propSafe(inst, "Name") or "?"),
 								cls = tostring(cls),
 								path = pathStr,
 								val = val,
+								txt = txt,
 								vis = vis,
 								attrs = attrs,
 							}
-							if string.find(pathStr, "PlayerGui", 1, true) and w >= 5 then
-								guiTarget[#guiTarget + 1] = item
-							elseif string.find(pathStr, "__HIDDEN_PETS", 1, true) then
+							if string.find(pathL, "playergui", 1, true) and isRerollGuiPath(pathL) then
+								rerollGui[#rerollGui + 1] = item
+							elseif string.find(pathL, "__hidden_pets", 1, true) then
 								hiddenPets[#hiddenPets + 1] = item
 							elseif isValueKind(cls) or w >= 6 then
 								otherTarget[#otherTarget + 1] = item
@@ -564,7 +598,7 @@ local function captureTargetSnapshot()
 	local function appendGroup(list, maxTake)
 		local taken = 0
 		for _, item in ipairs(list) do
-			if count >= 90 or taken >= maxTake then
+			if count >= 100 or taken >= maxTake then
 				break
 			end
 			count += 1
@@ -572,6 +606,9 @@ local function captureTargetSnapshot()
 			lines[#lines + 1] = string.format("• %s [%s] -> %s", item.name, item.cls, item.path)
 			if item.val ~= nil then
 				lines[#lines + 1] = "    Value = " .. fmtVal(item.val)
+			end
+			if item.txt ~= nil and tostring(item.txt) ~= "" then
+				lines[#lines + 1] = "    Text = " .. fmtVal(item.txt)
 			end
 			if item.vis ~= nil then
 				lines[#lines + 1] = "    Visible = " .. tostring(item.vis)
@@ -582,11 +619,11 @@ local function captureTargetSnapshot()
 		end
 	end
 
-	appendGroup(guiTarget, 35)
+	appendGroup(rerollGui, 40)
 	appendGroup(hiddenPets, 30)
-	appendGroup(otherTarget, 25)
+	appendGroup(otherTarget, 30)
 
-	lines[#lines + 1] = "Snapshot Items: " .. tostring(count) .. " (GUI:" .. tostring(#guiTarget) .. " | Pets:" .. tostring(#hiddenPets) .. " | Other:" .. tostring(#otherTarget) .. ")"
+	lines[#lines + 1] = "Snapshot Items: " .. tostring(count) .. " (RerollGUI:" .. tostring(#rerollGui) .. " | Pets:" .. tostring(#hiddenPets) .. " | Other:" .. tostring(#otherTarget) .. ")"
 	snapshotText = table.concat(lines, "\n")
 	rightViewMode = "Snapshot"
 	if ui.viewModeBtn then
@@ -860,7 +897,8 @@ local function insertEntry(inst)
 	entryOrder[#entryOrder + 1] = entry
 	entryCount += 1
 
-	if isValueKind(info.className) or info.weight > 0 then
+	local pathL = string.lower(info.fullName)
+	if isValueKind(info.className) or info.weight > 0 or isRerollGuiPath(pathL) then
 		local okAttr, attrSig = pcall(function()
 			return inst.AttributeChanged
 		end)
@@ -901,6 +939,28 @@ local function insertEntry(inst)
 						renderRightBox()
 					end
 					applyViewFilter()
+				end)
+			end
+		end
+
+		if isClass(inst, "TextLabel") and isRerollGuiPath(pathL) then
+			local okTxt, txtSig = pcall(function()
+				return inst:GetPropertyChangedSignal("Text")
+			end)
+			if okTxt and txtSig then
+				entry.conns[#entry.conns + 1] = txtSig:Connect(function()
+					if destroyed or entries[inst] ~= entry then
+						return
+					end
+					local oldT = entry.info.props.Text or ""
+					local newT = tostring(propSafe(inst, "Text") or "")
+					if oldT ~= newT then
+						entry.info.props.Text = fmtVal(newT)
+						pushLiveEvent(inst, string.format("Text (%s -> %s)", fmtVal(oldT), fmtVal(newT)))
+						if ui.selected == entry and rightViewMode == "Details" then
+							renderRightBox()
+						end
+					end
 				end)
 			end
 		end
@@ -983,7 +1043,7 @@ end
 local function buildFullReport()
 	local out = {
 		"=== RUNTIME INSPECTOR ROLLBACK ARCHITECTURE REPORT ===",
-		"Target Scope: Trait Reroll / Stats & Potential Reroll / Rollback & State / Endpoints",
+		"Target Scope: Trait Reroll / Stat & Potential Reroll / Rollback & State / Endpoints",
 		"Mark #" .. tostring(markCounter) .. " | HookedCalls: " .. tostring(safeCallsHooked) .. " | Inspected: " .. tostring(#inspectedHistory) .. " | Live: " .. tostring(#liveEvents),
 		"",
 		"--- [1] LIVE NOW & CALLS ---",
@@ -1609,13 +1669,14 @@ local function bindInspectorEvents()
 				return
 			end
 			local pathStr = fullPathSafe(inst)
-			if isNoisePath(string.lower(pathStr)) then
+			local pathL = string.lower(pathStr)
+			if isNoisePath(pathL) then
 				return
 			end
-			if (cls == "RemoteFunction" or cls == "RemoteEvent") and string.find(string.lower(pathStr), "endpoints", 1, true) then
+			if (cls == "RemoteFunction" or cls == "RemoteEvent") and string.find(pathL, "endpoints", 1, true) then
 				hookSingleRemoteSafe(inst)
 			end
-			if targetWeight(inst) > 0 then
+			if targetWeight(inst) > 0 or isRerollGuiPath(pathL) then
 				pushLiveEvent(inst, "added")
 				applyViewFilter()
 			end
