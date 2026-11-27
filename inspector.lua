@@ -13,10 +13,10 @@ local UserInputService = getServiceSafe("UserInputService")
 
 local GUI_TAG = "RuntimeInspector_7C1E9A"
 local GUARD_KEY = "__RuntimeInspectorGuard_" .. GUI_TAG
-local MAX_ENTRIES = 140
-local MAX_TARGET_HITS = 450
-local MAX_LIVE_EVENTS = 180
-local SCAN_BATCH = 80
+local MAX_ENTRIES = 160
+local MAX_TARGET_HITS = 500
+local MAX_LIVE_EVENTS = 250
+local SCAN_BATCH = 90
 local MIN_SCORE = 2
 
 local W, H = 530, 585
@@ -35,7 +35,11 @@ local inspectedHistory = {}
 local inspectedSeen = {}
 local liveEvents = {}
 local liveEventSeen = {}
+local touchedPaths = {}
+local touchedOrder = {}
 local markCounter = 0
+local markStartClock = os.clock()
+local lastEventClock = nil
 local snapshotText = ""
 
 local activeFilter = "All"
@@ -62,8 +66,9 @@ local C = {
 
 local TARGET_KEYWORDS = {
 	"trait", "traitreroll", "reroll", "roll", "potential",
-	"stat", "statreroll", "base_stats", "cube", "token",
-	"rollback", "undo", "revert", "rejoin", "state", "save", "data",
+	"stat", "statreroll", "base_stats", "curse", "cube", "token", "quantity",
+	"rollback", "undo", "revert", "rejoin", "confirm", "activate",
+	"teleport", "session", "sync", "state", "save", "data", "store",
 	"remote", "event", "function", "bindable", "unit", "equip",
 	"setting", "config", "profile", "pet", "endpoint", "snapshot", "backup",
 }
@@ -78,6 +83,7 @@ local NOISE_PATH_PATTERNS = {
 	"chatwindow",
 	"_overhead",
 	"_fx_cache",
+	"collection.grid.list.outer.unitframes",
 }
 
 local VALUE_PROPS = {
@@ -93,6 +99,9 @@ local SKIP_CLASSES = {
 	UIPadding = true, UISizeConstraint = true,
 	UIAspectRatioConstraint = true, UIStroke = true,
 	BillboardGui = true, SurfaceGui = true,
+	WorldModel = true, ViewportFrame = true, Bone = true,
+	BodyColors = true, Shirt = true, Pants = true,
+	RopeConstraint = true, AlignPosition = true, AlignOrientation = true,
 	MeshPart = true, Part = true, UnionOperation = true, WedgePart = true, CornerWedgePart = true,
 	Weld = true, WeldConstraint = true, Motor6D = true, Attachment = true,
 	ParticleEmitter = true, Beam = true, Trail = true, Light = true, PointLight = true, SpotLight = true, SurfaceLight = true,
@@ -236,6 +245,55 @@ local function isRerollGuiPath(pathLower)
 		or string.find(pathLower, "reroll", 1, true) ~= nil
 end
 
+local function classifyPhase(textLower)
+	if string.find(textLower, "teleport", 1, true)
+		or string.find(textLower, "rejoin", 1, true)
+		or string.find(textLower, "rollback", 1, true)
+		or string.find(textLower, "revert", 1, true)
+		or string.find(textLower, "confirm", 1, true)
+		or string.find(textLower, "save", 1, true)
+		or string.find(textLower, "sync", 1, true)
+	then
+		return "SAVE/ROLLBACK"
+	end
+	if string.find(textLower, "[fn]", 1, true)
+		or string.find(textLower, "[ev]", 1, true)
+		or string.find(textLower, "reroll", 1, true)
+		or string.find(textLower, "trait", 1, true)
+		or string.find(textLower, "stat", 1, true)
+	then
+		return "REROLL/REMOTE"
+	end
+	if string.find(textLower, "attr:", 1, true)
+		or string.find(textLower, "value (", 1, true)
+		or string.find(textLower, "text (", 1, true)
+	then
+		return "STATE/VAL"
+	end
+	return "UI/NODE"
+end
+
+local function recordTouchedPath(pathStr, phase)
+	if not pathStr or pathStr == "" then
+		return
+	end
+	if not touchedPaths[pathStr] then
+		touchedPaths[pathStr] = { count = 1, lastPhase = phase }
+		touchedOrder[#touchedOrder + 1] = pathStr
+	else
+		touchedPaths[pathStr].count += 1
+		touchedPaths[pathStr].lastPhase = phase
+	end
+end
+
+local function formatTimingTag()
+	local now = os.clock()
+	local sinceMark = math.max(0, now - markStartClock)
+	local delta = lastEventClock and math.max(0, now - lastEventClock) or sinceMark
+	lastEventClock = now
+	return string.format("t=+%.2fs | dt=+%.2fs", sinceMark, delta)
+end
+
 local function serializeArg(val, depth)
 	depth = depth or 0
 	if depth > 2 then
@@ -322,12 +380,17 @@ local function targetWeight(inst)
 	local nameL = string.lower(tostring(propSafe(inst, "Name") or ""))
 	local w = 0
 	if string.find(pathL, "endpoints", 1, true) then
-		w += 10
+		w += 12
 	end
 	if isRerollGuiPath(pathL) then
-		w += 8
+		w += 9
 	end
-	if string.find(nameL, "reroll", 1, true) or string.find(nameL, "rollback", 1, true) then
+	if string.find(nameL, "reroll", 1, true)
+		or string.find(nameL, "rollback", 1, true)
+		or string.find(nameL, "rejoin", 1, true)
+		or string.find(nameL, "save", 1, true)
+		or string.find(nameL, "data", 1, true)
+	then
 		w += 6
 	end
 	for _, kw in ipairs(TARGET_KEYWORDS) do
@@ -467,11 +530,11 @@ local function renderRightBox()
 	if rightViewMode == "Live" then
 		local lines = {
 			"=== LIVE NOW & CALLS (Mark #" .. tostring(markCounter) .. ") ===",
-			"Direct Calls Hooked: " .. tostring(safeCallsHooked) .. " | Events: " .. tostring(#liveEvents),
+			"Hooked: " .. tostring(safeCallsHooked) .. " | Events: " .. tostring(#liveEvents) .. " | Paths: " .. tostring(#touchedOrder),
 			"",
 		}
 		if #liveEvents == 0 then
-			lines[#lines + 1] = "Waiting for changes or calls after Mark Now..."
+			lines[#lines + 1] = "Waiting for Remote calls or state changes..."
 		else
 			for i = math.max(1, #liveEvents - 35), #liveEvents do
 				lines[#lines + 1] = liveEvents[i]
@@ -494,17 +557,22 @@ local function renderRightBox()
 	end
 end
 
-local function pushRawLiveLine(rawLine)
+local function pushRawLiveLine(rawLine, sourcePath)
 	if destroyed or #liveEvents >= MAX_LIVE_EVENTS then
 		return
 	end
+	local timing = formatTimingTag()
+	local phase = classifyPhase(string.lower(tostring(rawLine) .. " " .. tostring(sourcePath or "")))
 	local prefix = (markCounter > 0) and ("[M" .. tostring(markCounter) .. "] ") or ""
-	local line = prefix .. rawLine
+	local line = string.format("%s[%s] (%s) %s", prefix, phase, timing, tostring(rawLine))
 	if liveEventSeen[line] then
 		return
 	end
 	liveEventSeen[line] = true
 	liveEvents[#liveEvents + 1] = line
+	if sourcePath then
+		recordTouchedPath(sourcePath, phase)
+	end
 	if rightViewMode == "Live" then
 		renderRightBox()
 	end
@@ -529,7 +597,7 @@ local function pushLiveEvent(inst, tagText)
 		pathStr,
 		tostring(tagText)
 	)
-	pushRawLiveLine(line)
+	pushRawLiveLine(line, pathStr)
 end
 
 local function captureTargetSnapshot()
@@ -639,6 +707,7 @@ local function hookSingleRemoteSafe(remote)
 		return
 	end
 	local cls = propSafe(remote, "ClassName")
+	local rPath = fullPathSafe(remote)
 	if cls == "RemoteFunction" then
 		local okGet, origFn = pcall(function()
 			return remote.InvokeServer
@@ -652,9 +721,9 @@ local function hookSingleRemoteSafe(remote)
 						for i = 1, math.min(#args, 6) do
 							argParts[#argParts + 1] = serializeArg(args[i], 0)
 						end
-						local msg = string.format("[FN] %s(%s)", fullPathSafe(self), table.concat(argParts, ", "))
+						local msg = string.format("[FN] %s(%s)", rPath, table.concat(argParts, ", "))
 						task.defer(function()
-							pushRawLiveLine(msg)
+							pushRawLiveLine(msg, rPath)
 						end)
 					end
 					return origFn(self, ...)
@@ -678,9 +747,9 @@ local function hookSingleRemoteSafe(remote)
 						for i = 1, math.min(#args, 6) do
 							argParts[#argParts + 1] = serializeArg(args[i], 0)
 						end
-						local msg = string.format("[EV] %s(%s)", fullPathSafe(self), table.concat(argParts, ", "))
+						local msg = string.format("[EV] %s(%s)", rPath, table.concat(argParts, ", "))
 						task.defer(function()
-							pushRawLiveLine(msg)
+							pushRawLiveLine(msg, rPath)
 						end)
 					end
 					return origFn(self, ...)
@@ -706,13 +775,12 @@ local function unhookAllRemotesSafe()
 	safeCallsHooked = 0
 end
 
-local function attachTargetRemotesSafe()
-	local ep = ReplicatedStorage and ReplicatedStorage:FindFirstChild("endpoints")
-	if not ep then
+local function attachAllRemotesSafe()
+	if not ReplicatedStorage then
 		return
 	end
 	local okD, desc = pcall(function()
-		return ep:GetDescendants()
+		return ReplicatedStorage:GetDescendants()
 	end)
 	if okD and type(desc) == "table" then
 		for _, inst in ipairs(desc) do
@@ -1008,8 +1076,12 @@ local function clearLogsData()
 	inspectedSeen = {}
 	liveEvents = {}
 	liveEventSeen = {}
+	touchedPaths = {}
+	touchedOrder = {}
 	snapshotText = ""
 	markCounter = 0
+	markStartClock = os.clock()
+	lastEventClock = nil
 	renderRightBox()
 	applyViewFilter()
 end
@@ -1043,11 +1115,24 @@ end
 local function buildFullReport()
 	local out = {
 		"=== RUNTIME INSPECTOR ROLLBACK ARCHITECTURE REPORT ===",
-		"Target Scope: Trait Reroll / Stat & Potential Reroll / Rollback & State / Endpoints",
+		"Target Scope: Trait Reroll / Stat & Potential Reroll / Save & Rollback / Endpoints",
 		"Mark #" .. tostring(markCounter) .. " | HookedCalls: " .. tostring(safeCallsHooked) .. " | Inspected: " .. tostring(#inspectedHistory) .. " | Live: " .. tostring(#liveEvents),
 		"",
-		"--- [1] LIVE NOW & CALLS ---",
+		"--- [0] TOUCHED ENTITIES & PHASES ---",
 	}
+
+	if #touchedOrder == 0 then
+		out[#out + 1] = "(None)"
+	else
+		for i = 1, math.min(#touchedOrder, 40) do
+			local p = touchedOrder[i]
+			local meta = touchedPaths[p]
+			out[#out + 1] = string.format("• [%s] (x%d) %s", meta.lastPhase, meta.count, p)
+		end
+	end
+
+	out[#out + 1] = ""
+	out[#out + 1] = "--- [1] LIVE NOW & CALLS ---"
 
 	if #liveEvents == 0 then
 		out[#out + 1] = "(None)"
@@ -1585,8 +1670,12 @@ local function bindInspectorEvents()
 			return
 		end
 		markCounter += 1
+		markStartClock = os.clock()
+		lastEventClock = markStartClock
 		liveEvents = {}
 		liveEventSeen = {}
+		touchedPaths = {}
+		touchedOrder = {}
 		rightViewMode = "Live"
 		if ui.viewModeBtn then
 			pcall(function()
@@ -1595,7 +1684,7 @@ local function bindInspectorEvents()
 		end
 		renderRightBox()
 		applyViewFilter()
-		setStatus("Marked Now #" .. tostring(markCounter))
+		setStatus("Marked Now #" .. tostring(markCounter) .. " (t=0.00s)")
 	end))
 
 	trackConn(ui.scanBtn.Activated:Connect(function()
@@ -1673,7 +1762,7 @@ local function bindInspectorEvents()
 			if isNoisePath(pathL) then
 				return
 			end
-			if (cls == "RemoteFunction" or cls == "RemoteEvent") and string.find(pathL, "endpoints", 1, true) then
+			if cls == "RemoteFunction" or cls == "RemoteEvent" then
 				hookSingleRemoteSafe(inst)
 			end
 			if targetWeight(inst) > 0 or isRerollGuiPath(pathL) then
@@ -1750,7 +1839,7 @@ task.defer(function()
 
 	buildInspectorUI()
 	bindInspectorEvents()
-	attachTargetRemotesSafe()
+	attachAllRemotesSafe()
 
 	local okParent = pcall(function()
 		ui.screenGui.Parent = parent
