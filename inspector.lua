@@ -64,7 +64,15 @@ local TARGET_KEYWORDS = {
 	"trait", "reroll", "roll", "potential", "stat", "cube", "token",
 	"rollback", "undo", "revert", "rejoin", "state", "save", "data",
 	"remote", "event", "function", "bindable", "unit", "equip",
-	"trade", "setting", "config", "profile", "pet", "endpoint",
+	"setting", "config", "profile", "pet", "endpoint", "snapshot", "backup",
+}
+
+local NOISE_PATH_PATTERNS = {
+	"leaderboard",
+	"_eventleaderboard",
+	"tradinglist",
+	"partyinvitelist",
+	"_fx_cache",
 }
 
 local VALUE_PROPS = {
@@ -79,6 +87,11 @@ local SKIP_CLASSES = {
 	UIGradient = true, UICorner = true, UIListLayout = true,
 	UIPadding = true, UISizeConstraint = true,
 	UIAspectRatioConstraint = true, UIStroke = true,
+	MeshPart = true, Part = true, UnionOperation = true, WedgePart = true, CornerWedgePart = true,
+	Weld = true, WeldConstraint = true, Motor6D = true, Attachment = true,
+	ParticleEmitter = true, Beam = true, Trail = true, Light = true, PointLight = true, SpotLight = true, SurfaceLight = true,
+	Sound = true, SpecialMesh = true, SurfaceAppearance = true,
+	Humanoid = true, Animator = true, AnimationController = true,
 }
 
 local function safeCall(fn, ...)
@@ -176,6 +189,28 @@ local function isOwnGui(inst)
 	return ok and res or false
 end
 
+local function isNoisePath(pathLower)
+	if not pathLower or pathLower == "" then
+		return false
+	end
+	for _, pat in ipairs(NOISE_PATH_PATTERNS) do
+		if string.find(pathLower, pat, 1, true) then
+			return true
+		end
+	end
+	if string.find(pathLower, "players.", 1, true) then
+		local lp = Players and Players.LocalPlayer
+		local lpName = lp and string.lower(tostring(propSafe(lp, "Name") or "")) or ""
+		if lpName ~= "" then
+			local prefix = "players." .. lpName
+			if not string.find(pathLower, prefix, 1, true) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 local function serializeArg(val, depth)
 	depth = depth or 0
 	if depth > 2 then
@@ -254,11 +289,17 @@ local function isValueKind(className)
 end
 
 local function targetWeight(inst)
-	local nameL = string.lower(tostring(propSafe(inst, "Name") or ""))
 	local pathL = string.lower(fullPathSafe(inst))
+	if isNoisePath(pathL) then
+		return 0
+	end
+	local nameL = string.lower(tostring(propSafe(inst, "Name") or ""))
 	local w = 0
 	if string.find(pathL, "endpoints", 1, true) then
 		w += 10
+	end
+	if string.find(nameL, "reroll", 1, true) or string.find(nameL, "rollback", 1, true) then
+		w += 6
 	end
 	for _, kw in ipairs(TARGET_KEYWORDS) do
 		if string.find(nameL, kw, 1, true) then
@@ -286,6 +327,10 @@ local function isTargetCandidate(inst)
 	if SKIP_CLASSES[cls] then
 		return false
 	end
+	local pathL = string.lower(fullPathSafe(inst))
+	if isNoisePath(pathL) then
+		return false
+	end
 	if isRemoteKind(cls) or cls == "ModuleScript" or isValueKind(cls) then
 		return true
 	end
@@ -300,6 +345,10 @@ local function scoreInst(inst)
 	if SKIP_CLASSES[cls] then
 		return 0
 	end
+	local pathL = string.lower(fullPathSafe(inst))
+	if isNoisePath(pathL) then
+		return 0
+	end
 	local s = targetWeight(inst)
 	if isRemoteKind(cls) then
 		s += 8
@@ -312,9 +361,6 @@ local function scoreInst(inst)
 	end
 	if isValueKind(cls) or isClass(inst, "ValueBase") then
 		s += 3
-	end
-	if isClass(inst, "LayerCollector") then
-		s += 2
 	end
 	local okTags, tags = pcall(function()
 		return CollectionService:GetTags(inst)
@@ -437,11 +483,19 @@ local function pushLiveEvent(inst, tagText)
 	if isOwnGui(inst) then
 		return
 	end
+	local cls = propSafe(inst, "ClassName")
+	if SKIP_CLASSES[cls] then
+		return
+	end
+	local pathStr = fullPathSafe(inst)
+	if isNoisePath(string.lower(pathStr)) then
+		return
+	end
 	local line = string.format(
 		"%s [%s] -> %s (%s)",
 		tostring(propSafe(inst, "Name") or "?"),
-		tostring(propSafe(inst, "ClassName") or "?"),
-		fullPathSafe(inst),
+		tostring(cls or "?"),
+		pathStr,
 		tostring(tagText)
 	)
 	pushRawLiveLine(line)
@@ -476,9 +530,9 @@ local function captureTargetSnapshot()
 		if okD and type(desc) == "table" then
 			for _, inst in ipairs(desc) do
 				if typeof(inst) == "Instance" and not isOwnGui(inst) then
+					local cls = propSafe(inst, "ClassName")
 					local pathStr = fullPathSafe(inst)
-					if not string.find(pathStr, "_FX_CACHE", 1, true) then
-						local cls = propSafe(inst, "ClassName")
+					if not SKIP_CLASSES[cls] and not isNoisePath(string.lower(pathStr)) then
 						local w = targetWeight(inst)
 						local attrs = attrsSafe(inst)
 						local val = isValueKind(cls) and propSafe(inst, "Value") or nil
@@ -797,6 +851,10 @@ local function insertEntry(inst)
 	end
 
 	local info = buildInstInfo(inst)
+	if isNoisePath(string.lower(info.fullName)) then
+		return
+	end
+
 	local entry = { inst = inst, info = info, row = nil, conns = {} }
 	entries[inst] = entry
 	entryOrder[#entryOrder + 1] = entry
@@ -896,6 +954,32 @@ local function clearLogsData()
 	applyViewFilter()
 end
 
+local function collectTargetRoots()
+	local roots = {}
+	if ReplicatedStorage then
+		local ep = ReplicatedStorage:FindFirstChild("endpoints")
+		if ep then
+			roots[#roots + 1] = ep
+		end
+		local hp = ReplicatedStorage:FindFirstChild("__HIDDEN_PETS")
+		if hp then
+			roots[#roots + 1] = hp
+		end
+		roots[#roots + 1] = ReplicatedStorage
+	end
+	local lp = Players and Players.LocalPlayer
+	if lp then
+		roots[#roots + 1] = lp
+		local pg = safeCall(function()
+			return lp:FindFirstChildOfClass("PlayerGui")
+		end)
+		if pg then
+			roots[#roots + 1] = pg
+		end
+	end
+	return roots
+end
+
 local function buildFullReport()
 	local out = {
 		"=== RUNTIME INSPECTOR ROLLBACK ARCHITECTURE REPORT ===",
@@ -931,21 +1015,7 @@ local function buildFullReport()
 	out[#out + 1] = ""
 	out[#out + 1] = "--- [4] SYSTEM CANDIDATES ---"
 
-	local roots = {}
-	if ReplicatedStorage then
-		roots[#roots + 1] = ReplicatedStorage
-	end
-	local lp = Players and Players.LocalPlayer
-	if lp then
-		roots[#roots + 1] = lp
-		local pg = safeCall(function()
-			return lp:FindFirstChildOfClass("PlayerGui")
-		end)
-		if pg then
-			roots[#roots + 1] = pg
-		end
-	end
-
+	local roots = collectTargetRoots()
 	local found = {}
 	local seen = {}
 	for _, root in ipairs(roots) do
@@ -992,21 +1062,43 @@ local function buildFullReport()
 	return table.concat(out, "\n"), limit
 end
 
-local function runScan()
+local function runScan(targetedOnly)
 	scanToken += 1
 	local token = scanToken
 	clearListEntries()
 
-	local okList, list = pcall(function()
-		return game:GetDescendants()
-	end)
-	if not okList or type(list) ~= "table" then
-		setStatus("Scan failed")
+	local list = {}
+	if targetedOnly then
+		local seen = {}
+		for _, root in ipairs(collectTargetRoots()) do
+			local okD, desc = pcall(function()
+				return root:GetDescendants()
+			end)
+			if okD and type(desc) == "table" then
+				for _, inst in ipairs(desc) do
+					if typeof(inst) == "Instance" and not seen[inst] then
+						seen[inst] = true
+						list[#list + 1] = inst
+					end
+				end
+			end
+		end
+	else
+		local okList, gameDesc = pcall(function()
+			return game:GetDescendants()
+		end)
+		if okList and type(gameDesc) == "table" then
+			list = gameDesc
+		end
+	end
+
+	if #list == 0 then
+		setStatus("Scan failed or empty")
 		return
 	end
 
 	local idx = 1
-	setStatus("Scanning 0/" .. #list)
+	setStatus((targetedOnly and "Targeted scan " or "Scanning ") .. "0/" .. #list)
 
 	task.defer(function()
 		while not destroyed and token == scanToken and idx <= #list and entryCount < MAX_ENTRIES do
@@ -1448,7 +1540,7 @@ local function bindInspectorEvents()
 
 	trackConn(ui.scanBtn.Activated:Connect(function()
 		if not destroyed then
-			runScan()
+			runScan(false)
 		end
 	end))
 
@@ -1513,7 +1605,14 @@ local function bindInspectorEvents()
 				return
 			end
 			local cls = propSafe(inst, "ClassName")
-			if (cls == "RemoteFunction" or cls == "RemoteEvent") and fullPathSafe(inst):find("endpoints", 1, true) then
+			if SKIP_CLASSES[cls] then
+				return
+			end
+			local pathStr = fullPathSafe(inst)
+			if isNoisePath(string.lower(pathStr)) then
+				return
+			end
+			if (cls == "RemoteFunction" or cls == "RemoteEvent") and string.find(string.lower(pathStr), "endpoints", 1, true) then
 				hookSingleRemoteSafe(inst)
 			end
 			if targetWeight(inst) > 0 then
@@ -1601,5 +1700,5 @@ task.defer(function()
 	end
 
 	setStatus("Ready (" .. tostring(mountSrc) .. ") | Calls:" .. tostring(safeCallsHooked))
-	runScan()
+	runScan(true)
 end)
