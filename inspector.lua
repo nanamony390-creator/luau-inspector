@@ -13,8 +13,8 @@ local UserInputService = getServiceSafe("UserInputService")
 
 local GUI_TAG = "RuntimeInspector_7C1E9A"
 local GUARD_KEY = "__RuntimeInspectorGuard_" .. GUI_TAG
-local MAX_ENTRIES = 140
-local MAX_TARGET_HITS = 500
+local MAX_ENTRIES = 120
+local MAX_TARGET_HITS = 400
 local MAX_LIVE_EVENTS = 160
 local SCAN_BATCH = 80
 local MIN_SCORE = 2
@@ -36,14 +36,15 @@ local inspectedSeen = {}
 local liveEvents = {}
 local liveEventSeen = {}
 local markCounter = 0
+local snapshotText = ""
 
 local activeFilter = "All"
 local searchQuery = ""
-local rightViewMode = "Details"
+local rightViewMode = "Details" -- "Details" | "Live" | "Snapshot"
 local scanToken = 0
 local destroyed = false
-local spyActive = false
-local oldNamecall = nil
+local safeCallsHooked = 0
+local hookedRemotes = {}
 local ui = {}
 
 local C = {
@@ -67,10 +68,8 @@ local TARGET_KEYWORDS = {
 }
 
 local VALUE_PROPS = {
-	Value = true, Position = true, CFrame = true, Size = true,
-	Color = true, Transparency = true, Anchored = true, Health = true,
-	MaxHealth = true, WalkSpeed = true, Text = true, Visible = true,
-	Enabled = true, Name = true, ClassName = true,
+	Value = true, Text = true, Visible = true, Enabled = true,
+	Name = true, ClassName = true,
 }
 
 local SKIP_CLASSES = {
@@ -380,14 +379,22 @@ local function renderRightBox()
 	if not ui.details then
 		return
 	end
+	if rightViewMode == "Snapshot" then
+		local txt = (snapshotText ~= "") and snapshotText or "No snapshot taken yet. Click Snapshot to capture current target state."
+		pcall(function()
+			ui.details.Text = txt
+		end)
+		return
+	end
+
 	if rightViewMode == "Live" then
 		local lines = {
-			"=== LIVE NOW & REMOTE SPY (Mark #" .. tostring(markCounter) .. ") ===",
-			"Spy: " .. (spyActive and "ON" or "OFF") .. " | Events: " .. tostring(#liveEvents),
+			"=== LIVE NOW & CALLS (Mark #" .. tostring(markCounter) .. ") ===",
+			"Direct Calls Hooked: " .. tostring(safeCallsHooked) .. " | Events: " .. tostring(#liveEvents),
 			"",
 		}
 		if #liveEvents == 0 then
-			lines[#lines + 1] = "Perform action in-game (open/reroll/toggle) to capture calls & changes..."
+			lines[#lines + 1] = "Waiting for changes or calls after Mark Now..."
 		else
 			for i = math.max(1, #liveEvents - 35), #liveEvents do
 				lines[#lines + 1] = liveEvents[i]
@@ -405,7 +412,7 @@ local function renderRightBox()
 		end)
 	else
 		pcall(function()
-			ui.details.Text = "Select an item or switch to Live Now."
+			ui.details.Text = "Select an item, switch to Live Now, or take a Snapshot."
 		end)
 	end
 end
@@ -438,6 +445,163 @@ local function pushLiveEvent(inst, tagText)
 		tostring(tagText)
 	)
 	pushRawLiveLine(line)
+end
+
+local function captureTargetSnapshot()
+	local lines = {
+		"=== STATE SNAPSHOT (Mark #" .. tostring(markCounter) .. ") ===",
+	}
+	local roots = {}
+	if ReplicatedStorage then
+		roots[#roots + 1] = ReplicatedStorage
+	end
+	local lp = Players and Players.LocalPlayer
+	if lp then
+		local pg = safeCall(function()
+			return lp:FindFirstChildOfClass("PlayerGui")
+		end)
+		if pg then
+			roots[#roots + 1] = pg
+		end
+	end
+
+	local count = 0
+	for _, root in ipairs(roots) do
+		local okD, desc = pcall(function()
+			return root:GetDescendants()
+		end)
+		if okD and type(desc) == "table" then
+			for _, inst in ipairs(desc) do
+				if typeof(inst) == "Instance" and not isOwnGui(inst) then
+					local cls = propSafe(inst, "ClassName")
+					local w = targetWeight(inst)
+					if isValueKind(cls) or w >= 12 then
+						local attrs = attrsSafe(inst)
+						local val = isValueKind(cls) and propSafe(inst, "Value") or nil
+						local vis = propSafe(inst, "Visible")
+						if next(attrs) ~= nil or val ~= nil or vis ~= nil then
+							count += 1
+							lines[#lines + 1] = string.format("• %s [%s] -> %s", tostring(propSafe(inst, "Name") or "?"), tostring(cls), fullPathSafe(inst))
+							if val ~= nil then
+								lines[#lines + 1] = "    Value = " .. fmtVal(val)
+							end
+							if vis ~= nil then
+								lines[#lines + 1] = "    Visible = " .. tostring(vis)
+							end
+							for k, v in pairsSorted(attrs) do
+								lines[#lines + 1] = "    attr " .. k .. " = " .. fmtVal(v)
+							end
+							if count >= 90 then
+								break
+							end
+						end
+					end
+				end
+			end
+		end
+		if count >= 90 then
+			break
+		end
+	end
+	lines[#lines + 1] = "Snapshot Items: " .. tostring(count)
+	snapshotText = table.concat(lines, "\n")
+	rightViewMode = "Snapshot"
+	if ui.viewModeBtn then
+		pcall(function()
+			ui.viewModeBtn.Text = "View: Snapshot"
+		end)
+	end
+	renderRightBox()
+end
+
+local function hookSingleRemoteSafe(remote)
+	if destroyed or typeof(remote) ~= "Instance" or hookedRemotes[remote] or isOwnGui(remote) then
+		return
+	end
+	local cls = propSafe(remote, "ClassName")
+	if cls == "RemoteFunction" then
+		local okGet, origFn = pcall(function()
+			return remote.InvokeServer
+		end)
+		if okGet and type(origFn) == "function" then
+			local okSet = pcall(function()
+				remote.InvokeServer = function(self, ...)
+					if not destroyed then
+						local args = { ... }
+						local argParts = {}
+						for i = 1, math.min(#args, 6) do
+							argParts[#argParts + 1] = serializeArg(args[i], 0)
+						end
+						local msg = string.format("[FN] %s(%s)", fullPathSafe(self), table.concat(argParts, ", "))
+						task.defer(function()
+							pushRawLiveLine(msg)
+						end)
+					end
+					return origFn(self, ...)
+				end
+			end)
+			if okSet then
+				hookedRemotes[remote] = { fnProp = "InvokeServer", orig = origFn }
+				safeCallsHooked += 1
+			end
+		end
+	elseif cls == "RemoteEvent" then
+		local okGet, origFn = pcall(function()
+			return remote.FireServer
+		end)
+		if okGet and type(origFn) == "function" then
+			local okSet = pcall(function()
+				remote.FireServer = function(self, ...)
+					if not destroyed then
+						local args = { ... }
+						local argParts = {}
+						for i = 1, math.min(#args, 6) do
+							argParts[#argParts + 1] = serializeArg(args[i], 0)
+						end
+						local msg = string.format("[EV] %s(%s)", fullPathSafe(self), table.concat(argParts, ", "))
+						task.defer(function()
+							pushRawLiveLine(msg)
+						end)
+					end
+					return origFn(self, ...)
+				end
+			end)
+			if okSet then
+				hookedRemotes[remote] = { fnProp = "FireServer", orig = origFn }
+				safeCallsHooked += 1
+			end
+		end
+	end
+end
+
+local function unhookAllRemotesSafe()
+	for remote, info in pairs(hookedRemotes) do
+		if typeof(remote) == "Instance" and type(info) == "table" and info.fnProp and type(info.orig) == "function" then
+			pcall(function()
+				remote[info.fnProp] = info.orig
+			end)
+		end
+	end
+	hookedRemotes = {}
+	safeCallsHooked = 0
+end
+
+local function attachTargetRemotesSafe()
+	local ep = ReplicatedStorage and ReplicatedStorage:FindFirstChild("endpoints")
+	if not ep then
+		return
+	end
+	local okD, desc = pcall(function()
+		return ep:GetDescendants()
+	end)
+	if okD and type(desc) == "table" then
+		for _, inst in ipairs(desc) do
+			local cls = propSafe(inst, "ClassName")
+			if cls == "RemoteFunction" or cls == "RemoteEvent" then
+				hookSingleRemoteSafe(inst)
+			end
+		end
+	end
 end
 
 local function pushInspected(info)
@@ -609,47 +773,49 @@ local function insertEntry(inst)
 	entryOrder[#entryOrder + 1] = entry
 	entryCount += 1
 
-	local okAttr, attrSig = pcall(function()
-		return inst.AttributeChanged
-	end)
-	if okAttr and attrSig then
-		entry.conns[#entry.conns + 1] = attrSig:Connect(function(attrName)
-			if destroyed or entries[inst] ~= entry then
-				return
-			end
-			local okV, v = pcall(function()
-				return inst:GetAttribute(attrName)
-			end)
-			local formatted = okV and fmtVal(v) or "?"
-			entry.info.attrs[tostring(attrName)] = formatted
-			pushLiveEvent(inst, "attr:" .. tostring(attrName) .. "=" .. formatted)
-			refreshRowStyle(entry)
-			if ui.selected == entry and rightViewMode == "Details" then
-				renderRightBox()
-			end
-			applyViewFilter()
+	if isValueKind(info.className) or info.weight > 0 then
+		local okAttr, attrSig = pcall(function()
+			return inst.AttributeChanged
 		end)
-	end
-
-	for _, propName in ipairs(info.propKeys) do
-		local okSig, sig = pcall(function()
-			return inst:GetPropertyChangedSignal(propName)
-		end)
-		if okSig and sig then
-			entry.conns[#entry.conns + 1] = sig:Connect(function()
+		if okAttr and attrSig then
+			entry.conns[#entry.conns + 1] = attrSig:Connect(function(attrName)
 				if destroyed or entries[inst] ~= entry then
 					return
 				end
-				local formatted = fmtVal(propSafe(inst, propName))
-				entry.info.props[propName] = formatted
-				if propName == "Value" or propName == "Visible" or propName == "Text" then
-					pushLiveEvent(inst, propName .. "=" .. formatted)
-				end
+				local oldV = entry.info.attrs[tostring(attrName)] or "nil"
+				local okV, v = pcall(function()
+					return inst:GetAttribute(attrName)
+				end)
+				local newV = okV and fmtVal(v) or "?"
+				entry.info.attrs[tostring(attrName)] = newV
+				pushLiveEvent(inst, string.format("attr:%s (%s -> %s)", tostring(attrName), oldV, newV))
+				refreshRowStyle(entry)
 				if ui.selected == entry and rightViewMode == "Details" then
 					renderRightBox()
 				end
 				applyViewFilter()
 			end)
+		end
+
+		if isValueKind(info.className) then
+			local okSig, sig = pcall(function()
+				return inst:GetPropertyChangedSignal("Value")
+			end)
+			if okSig and sig then
+				entry.conns[#entry.conns + 1] = sig:Connect(function()
+					if destroyed or entries[inst] ~= entry then
+						return
+					end
+					local oldV = entry.info.props.Value or "nil"
+					local newV = fmtVal(propSafe(inst, "Value"))
+					entry.info.props.Value = newV
+					pushLiveEvent(inst, string.format("Value (%s -> %s)", oldV, newV))
+					if ui.selected == entry and rightViewMode == "Details" then
+						renderRightBox()
+					end
+					applyViewFilter()
+				end)
+			end
 		end
 	end
 
@@ -695,84 +861,21 @@ local function clearLogsData()
 	inspectedSeen = {}
 	liveEvents = {}
 	liveEventSeen = {}
+	snapshotText = ""
 	markCounter = 0
 	renderRightBox()
 	applyViewFilter()
-end
-
-local function setupRemoteSpy()
-	local hookMeta = findExecutorFn("hookmetamethod")
-	local getMethod = findExecutorFn("getnamecallmethod")
-	local checkCaller = findExecutorFn("checkcaller")
-	if type(hookMeta) ~= "function" or type(getMethod) ~= "function" then
-		return false
-	end
-
-	local okHook, prev = pcall(function()
-		return hookMeta(game, "__namecall", function(self, ...)
-			local method = getMethod()
-			local fromCaller = (type(checkCaller) == "function") and checkCaller() or false
-			if not destroyed and not fromCaller and (method == "InvokeServer" or method == "FireServer") then
-				if typeof(self) == "Instance" and not isOwnGui(self) then
-					local args = { ... }
-					local argStrs = {}
-					for i = 1, math.min(#args, 6) do
-						argStrs[#argStrs + 1] = serializeArg(args[i], 0)
-					end
-					local callLine = string.format(
-						"[CALL:%s] %s(%s)",
-						tostring(method),
-						fullPathSafe(self),
-						table.concat(argStrs, ", ")
-					)
-					task.defer(function()
-						pushRawLiveLine(callLine)
-						applyViewFilter()
-					end)
-				end
-			end
-			return oldNamecall(self, ...)
-		end)
-	end)
-
-	if okHook and type(prev) == "function" then
-		oldNamecall = prev
-		spyActive = true
-		return true
-	end
-	return false
 end
 
 local function buildFullReport()
 	local out = {
 		"=== RUNTIME INSPECTOR ROLLBACK ARCHITECTURE REPORT ===",
 		"Target Scope: Trait Reroll / Stats & Potential Reroll / Rollback & State / Endpoints",
-		"Mark #" .. tostring(markCounter) .. " | RemoteSpy: " .. (spyActive and "ON" or "OFF") .. " | Inspected: " .. tostring(#inspectedHistory) .. " | Live: " .. tostring(#liveEvents),
+		"Mark #" .. tostring(markCounter) .. " | HookedCalls: " .. tostring(safeCallsHooked) .. " | Inspected: " .. tostring(#inspectedHistory) .. " | Live: " .. tostring(#liveEvents),
 		"",
-		"--- [1] ALL ENDPOINTS (COMPLETE CLIENT <-> SERVER MAP) ---",
+		"--- [1] LIVE NOW & CALLS ---",
 	}
 
-	local endpointsFolder = ReplicatedStorage and ReplicatedStorage:FindFirstChild("endpoints")
-	if endpointsFolder then
-		local epList = endpointsFolder:GetDescendants()
-		table.sort(epList, function(a, b)
-			return fullPathSafe(a) < fullPathSafe(b)
-		end)
-		local epCount = 0
-		for _, ep in ipairs(epList) do
-			local cls = propSafe(ep, "ClassName")
-			if isRemoteKind(cls) then
-				epCount += 1
-				out[#out + 1] = string.format("• [%s] %s", tostring(cls), fullPathSafe(ep))
-			end
-		end
-		out[#out + 1] = "Total Endpoints Found: " .. tostring(epCount)
-	else
-		out[#out + 1] = "(ReplicatedStorage.endpoints not found)"
-	end
-
-	out[#out + 1] = ""
-	out[#out + 1] = "--- [2] LIVE NOW & REMOTE CALLS ---"
 	if #liveEvents == 0 then
 		out[#out + 1] = "(None)"
 	else
@@ -780,6 +883,10 @@ local function buildFullReport()
 			out[#out + 1] = line
 		end
 	end
+
+	out[#out + 1] = ""
+	out[#out + 1] = "--- [2] SNAPSHOT ---"
+	out[#out + 1] = (snapshotText ~= "") and snapshotText or "(No snapshot captured)"
 
 	out[#out + 1] = ""
 	out[#out + 1] = "--- [3] USER INSPECTED ---"
@@ -793,7 +900,7 @@ local function buildFullReport()
 	end
 
 	out[#out + 1] = ""
-	out[#out + 1] = "--- [4] MATCHED SYSTEM CANDIDATES ---"
+	out[#out + 1] = "--- [4] SYSTEM CANDIDATES ---"
 
 	local roots = {}
 	if ReplicatedStorage then
@@ -887,7 +994,7 @@ local function runScan()
 			task.wait()
 		end
 		if not destroyed and token == scanToken then
-			setStatus(string.format("Done - %d shown | Spy: %s", entryCount, spyActive and "ON" or "OFF"))
+			setStatus(string.format("Done - %d shown | Calls:%d", entryCount, safeCallsHooked))
 		end
 	end)
 end
@@ -915,6 +1022,7 @@ local function cleanupInspector()
 	end
 	destroyed = true
 	scanToken += 1
+	unhookAllRemotesSafe()
 
 	for _, c in ipairs(connections) do
 		pcall(function()
@@ -1012,7 +1120,7 @@ local function buildInspectorUI()
 	ui.searchBox.BorderSizePixel = 0
 	ui.searchBox.TextColor3 = C.text
 	ui.searchBox.PlaceholderColor3 = C.dim
-	ui.searchBox.PlaceholderText = "Search endpoints, trait, reroll, stat, path..."
+	ui.searchBox.PlaceholderText = "Search trait, reroll, stat, remote, path..."
 	ui.searchBox.Font = Enum.Font.SourceSans
 	ui.searchBox.TextSize = 13
 	ui.searchBox.TextXAlignment = Enum.TextXAlignment.Left
@@ -1076,7 +1184,7 @@ local function buildInspectorUI()
 	lLayout.Parent = ui.list
 
 	ui.details = Instance.new("TextBox")
-	ui.details.Size = UDim2.new(0, DET_W, 0, CONTENT_H - 58)
+	ui.details.Size = UDim2.new(0, DET_W, 0, CONTENT_H - 84)
 	ui.details.Position = UDim2.new(0, DET_X, 0, TOP)
 	ui.details.BackgroundColor3 = C.panel
 	ui.details.BorderSizePixel = 0
@@ -1088,7 +1196,7 @@ local function buildInspectorUI()
 	ui.details.TextWrapped = true
 	ui.details.TextEditable = false
 	ui.details.ClearTextOnFocus = false
-	ui.details.Text = "Select an item or switch to Live Now."
+	ui.details.Text = "Select an item, switch to Live Now, or take a Snapshot."
 	ui.details.Parent = ui.main
 
 	local dPad = Instance.new("UIPadding")
@@ -1100,10 +1208,26 @@ local function buildInspectorUI()
 	dCorner.CornerRadius = UDim.new(0, 6)
 	dCorner.Parent = ui.details
 
+	ui.snapBtn = Instance.new("TextButton")
+	ui.snapBtn.Name = "Snapshot"
+	ui.snapBtn.Size = UDim2.new(0, DET_W, 0, 24)
+	ui.snapBtn.Position = UDim2.new(0, DET_X, 0, TOP + CONTENT_H - 78)
+	ui.snapBtn.BackgroundColor3 = C.btn
+	ui.snapBtn.BorderSizePixel = 0
+	ui.snapBtn.TextColor3 = C.text
+	ui.snapBtn.Font = Enum.Font.SourceSansSemibold
+	ui.snapBtn.TextSize = 12
+	ui.snapBtn.Text = "Snapshot State"
+	ui.snapBtn.Parent = ui.main
+
+	local snCorner = Instance.new("UICorner")
+	snCorner.CornerRadius = UDim.new(0, 5)
+	snCorner.Parent = ui.snapBtn
+
 	ui.viewModeBtn = Instance.new("TextButton")
 	ui.viewModeBtn.Name = "ViewMode"
 	ui.viewModeBtn.Size = UDim2.new(0, DET_W, 0, 24)
-	ui.viewModeBtn.Position = UDim2.new(0, DET_X, 0, TOP + CONTENT_H - 52)
+	ui.viewModeBtn.Position = UDim2.new(0, DET_X, 0, TOP + CONTENT_H - 51)
 	ui.viewModeBtn.BackgroundColor3 = C.btn
 	ui.viewModeBtn.BorderSizePixel = 0
 	ui.viewModeBtn.TextColor3 = C.text
@@ -1238,12 +1362,27 @@ local function bindInspectorEvents()
 		end))
 	end
 
+	trackConn(ui.snapBtn.Activated:Connect(function()
+		if not destroyed then
+			captureTargetSnapshot()
+			setStatus("Snapshot captured at Mark #" .. tostring(markCounter))
+		end
+	end))
+
 	trackConn(ui.viewModeBtn.Activated:Connect(function()
 		if destroyed then
 			return
 		end
-		rightViewMode = (rightViewMode == "Details") and "Live" or "Details"
-		ui.viewModeBtn.Text = (rightViewMode == "Details") and "View: Details" or "View: Live Now"
+		if rightViewMode == "Details" then
+			rightViewMode = "Live"
+			ui.viewModeBtn.Text = "View: Live Now"
+		elseif rightViewMode == "Live" then
+			rightViewMode = "Snapshot"
+			ui.viewModeBtn.Text = "View: Snapshot"
+		else
+			rightViewMode = "Details"
+			ui.viewModeBtn.Text = "View: Details"
+		end
 		renderRightBox()
 	end))
 
@@ -1294,7 +1433,7 @@ local function bindInspectorEvents()
 	trackConn(ui.clearLogBtn.Activated:Connect(function()
 		if not destroyed then
 			clearLogsData()
-			setStatus("Cleared Log & Live")
+			setStatus("Cleared Log, Live & Snapshot")
 		end
 	end))
 
@@ -1343,6 +1482,10 @@ local function bindInspectorEvents()
 				return inst.Parent
 			end) then
 				return
+			end
+			local cls = propSafe(inst, "ClassName")
+			if (cls == "RemoteFunction" or cls == "RemoteEvent") and fullPathSafe(inst):find("endpoints", 1, true) then
+				hookSingleRemoteSafe(inst)
 			end
 			if targetWeight(inst) > 0 then
 				pushLiveEvent(inst, "added")
@@ -1416,9 +1559,9 @@ task.defer(function()
 		end
 	end)
 
-	setupRemoteSpy()
 	buildInspectorUI()
 	bindInspectorEvents()
+	attachTargetRemotesSafe()
 
 	local okParent = pcall(function()
 		ui.screenGui.Parent = parent
@@ -1428,6 +1571,6 @@ task.defer(function()
 		return
 	end
 
-	setStatus("Ready (" .. tostring(mountSrc) .. ") | Spy: " .. (spyActive and "ON" or "OFF"))
+	setStatus("Ready (" .. tostring(mountSrc) .. ") | Calls:" .. tostring(safeCallsHooked))
 	runScan()
 end)
