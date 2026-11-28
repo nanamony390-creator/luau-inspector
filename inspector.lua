@@ -7,33 +7,45 @@ end
 
 local Players = getServiceSafe("Players")
 local ReplicatedStorage = getServiceSafe("ReplicatedStorage")
+local TeleportService = getServiceSafe("TeleportService")
 local CoreGui = getServiceSafe("CoreGui")
 local UserInputService = getServiceSafe("UserInputService")
+local HttpService = getServiceSafe("HttpService")
 
-local TEST_TAG = "RollbackTest03_PostExitConsistency"
-local GUARD_KEY = "__TestGuard_" .. TEST_TAG
+local APP_TAG = "RollbackLab_LiveTrial_v2"
+local GUARD_KEY = "__LiveTrialGuard_" .. APP_TAG
+local CHECKPOINT_FILE = "RollbackLab_v2_Checkpoint.json"
 
 local connections = {}
 local destroyed = false
 local ui = {}
 
 local C = {
-	bg = Color3.fromRGB(20, 22, 28),
-	panel = Color3.fromRGB(15, 17, 22),
-	card = Color3.fromRGB(28, 32, 40),
-	text = Color3.fromRGB(228, 234, 244),
+	bg = Color3.fromRGB(18, 20, 26),
+	panel = Color3.fromRGB(13, 15, 20),
+	card = Color3.fromRGB(26, 30, 38),
+	text = Color3.fromRGB(232, 238, 248),
 	dim = Color3.fromRGB(148, 156, 170),
-	accent = Color3.fromRGB(54, 96, 148),
-	good = Color3.fromRGB(40, 108, 82),
-	danger = Color3.fromRGB(138, 48, 54),
-	btn = Color3.fromRGB(46, 52, 66),
+	accent = Color3.fromRGB(52, 98, 156),
+	good = Color3.fromRGB(38, 114, 84),
+	warn = Color3.fromRGB(168, 102, 34),
+	danger = Color3.fromRGB(154, 48, 54),
+	btn = Color3.fromRGB(44, 50, 64),
 }
 
 local state = {
-	armed = false,
-	lastTokens = "Unknown",
-	lastUnitId = "Unknown",
-	lastTrait = "N/A",
+	armed = true,
+	trialCount = 0,
+	unitGuid = "Unknown",
+	unitName = "Unknown",
+	liveTrait = "N/A",
+	liveTokens = "Unknown",
+	curseTokens = "Unknown",
+	statPreview = "N/A",
+	raceDelayMs = 15, -- Default timing window in ms before rejoin trigger
+	lastSyncClock = 0,
+	savedCheckpoint = nil,
+	verdict = "Ready: Select unit in TraitReroll, Save Checkpoint, then run Test.",
 	logs = {},
 }
 
@@ -59,90 +71,288 @@ end
 
 local function setClipboardSafe(text)
 	local fn = findExecutorFn("setclipboard") or findExecutorFn("toclipboard")
-	if type(fn) == "function" and pcall(fn, text) then
-		return true
+	return type(fn) == "function" and pcall(fn, text) or false
+end
+
+local function writeCheckpointFile(dataTable)
+	local writeFn = findExecutorFn("writefile")
+	if type(writeFn) == "function" and HttpService then
+		local okEnc, json = pcall(function()
+			return HttpService:JSONEncode(dataTable)
+		end)
+		if okEnc and json then
+			return pcall(writeFn, CHECKPOINT_FILE, json)
+		end
 	end
 	return false
+end
+
+local function readCheckpointFile()
+	local readFn = findExecutorFn("readfile")
+	local isFileFn = findExecutorFn("isfile")
+	if type(readFn) == "function" and HttpService then
+		if type(isFileFn) == "function" then
+			local okExists, exists = pcall(isFileFn, CHECKPOINT_FILE)
+			if not (okExists and exists) then
+				return nil
+			end
+		end
+		local okRead, raw = pcall(readFn, CHECKPOINT_FILE)
+		if okRead and type(raw) == "string" and raw ~= "" then
+			local okDec, tbl = pcall(function()
+				return HttpService:JSONDecode(raw)
+			end)
+			if okDec and type(tbl) == "table" then
+				return tbl
+			end
+		end
+	end
+	return nil
 end
 
 local function addLog(tag, msg)
 	local line = string.format("[%s | %.2fs] %s", tag, os.clock() % 1000, msg)
 	state.logs[#state.logs + 1] = line
-	if #state.logs > 90 then
+	if #state.logs > 110 then
 		table.remove(state.logs, 1)
 	end
 end
 
-local function readCurrentTrait()
+local function scanGuiState()
 	local lp = Players and Players.LocalPlayer
 	local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
-	local tr = pg and pg:FindFirstChild("TraitReroll")
-	local cur = tr and tr:FindFirstChild("CurrentTraitText", true)
-	if cur and cur:IsA("TextLabel") and cur.Text ~= "" then
-		state.lastTrait = cur.Text
+	if not pg then
+		return
 	end
-	return state.lastTrait
+
+	local tr = pg:FindFirstChild("TraitReroll")
+	if tr then
+		local cur = tr:FindFirstChild("CurrentTraitText", true)
+		if cur and cur:IsA("TextLabel") and cur.Text ~= "" then
+			state.liveTrait = cur.Text
+		end
+
+		local recv = tr:FindFirstChild("ReceiveUnit", true)
+		if recv then
+			local nameLbl = recv:FindFirstChild("name", true)
+			if nameLbl and nameLbl:IsA("TextLabel") and nameLbl.Text ~= "" and nameLbl.Text ~= "???" then
+				state.unitName = nameLbl.Text
+			end
+			-- Check attributes or StringValues for selected unit GUID
+			for _, attrKey in ipairs({ "GUID", "guid", "UnitGUID", "UniqueId", "id" }) do
+				local v = recv:GetAttribute(attrKey)
+				if type(v) == "string" and #v > 10 then
+					state.unitGuid = v
+					break
+				end
+			end
+		end
+
+		local utf = tr:FindFirstChild("UseTokenFrame", true)
+		if utf then
+			for _, d in ipairs(utf:GetDescendants()) do
+				if d:IsA("TextLabel") and string.find(d.Text, "/") then
+					local num = string.match(d.Text, "^(%d+)%s*/")
+					if num then
+						state.liveTokens = num
+						break
+					end
+				end
+			end
+		end
+	end
+
+	local sr = pg:FindFirstChild("StatReroll")
+	if sr then
+		local statsFrame = sr:FindFirstChild("UnitStats", true)
+		if statsFrame then
+			local parts = {}
+			for _, statName in ipairs({ "Attack", "Range", "Cooldown" }) do
+				local row = statsFrame:FindFirstChild(statName)
+				if row then
+					for _, lbl in ipairs(row:GetDescendants()) do
+						if lbl:IsA("TextLabel") and lbl.Text ~= "" and lbl.Text ~= statName and lbl.Text ~= "Reroll" then
+							parts[#parts + 1] = statName .. "=" .. lbl.Text
+							break
+						end
+					end
+				end
+			end
+			if #parts > 0 then
+				state.statPreview = table.concat(parts, ", ")
+			end
+		end
+	end
+end
+
+local function saveCheckpointNow(reasonTag)
+	scanGuiState()
+	local cp = {
+		unitGuid = state.unitGuid,
+		unitName = state.unitName,
+		trait = state.liveTrait,
+		tokens = state.liveTokens,
+		stats = state.statPreview,
+		savedAt = os.time(),
+	}
+	state.savedCheckpoint = cp
+	local savedToDisk = writeCheckpointFile(cp)
+	state.verdict = string.format(
+		"Checkpoint [%s] (%s): Trait=%s | Tokens=%s",
+		reasonTag or "MANUAL",
+		savedToDisk and "Disk+RAM" or "RAM",
+		tostring(cp.trait),
+		tostring(cp.tokens)
+	)
+	addLog("CHECKPOINT", state.verdict)
+	return cp
+end
+
+local function evaluateAgainstCheckpoint()
+	scanGuiState()
+	local cp = state.savedCheckpoint or readCheckpointFile()
+	if not cp then
+		state.verdict = "No prior checkpoint found. Save Checkpoint before running a trial."
+		addLog("COMPARE", "No prior checkpoint file found.")
+		return
+	end
+
+	state.savedCheckpoint = cp
+	local traitMatch = (cp.trait == state.liveTrait)
+	local tokenMatch = (tostring(cp.tokens) == "Unknown") or (tostring(cp.tokens) == tostring(state.liveTokens))
+
+	if traitMatch and tokenMatch then
+		state.verdict = string.format(
+			"VERDICT: PERSISTED (NO ROLLBACK) | Pre:[%s, Tok=%s] == Now:[%s, Tok=%s]",
+			tostring(cp.trait),
+			tostring(cp.tokens),
+			tostring(state.liveTrait),
+			tostring(state.liveTokens)
+		)
+	else
+		state.verdict = string.format(
+			"VERDICT: ROLLBACK / STATE DIFF! | Pre:[%s, Tok=%s] -> Now:[%s, Tok=%s]",
+			tostring(cp.trait),
+			tostring(cp.tokens),
+			tostring(state.liveTrait),
+			tostring(state.liveTokens)
+		)
+	end
+	addLog("COMPARE", state.verdict)
+end
+
+local function triggerRejoin(newServer)
+	local lp = Players and Players.LocalPlayer
+	if not (TeleportService and lp) then
+		addLog("REJOIN_ERR", "TeleportService or LocalPlayer unavailable.")
+		return
+	end
+	addLog("REJOIN", newServer and "Teleporting to fresh server..." or "Rejoining current PlaceId...")
+	pcall(function()
+		if not newServer and game.JobId and game.JobId ~= "" then
+			TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, lp)
+		else
+			TeleportService:Teleport(game.PlaceId, lp)
+		end
+	end)
+end
+
+local function getRerollEndpoint()
+	if not ReplicatedStorage then
+		return nil
+	end
+	local ep = ReplicatedStorage:FindFirstChild("endpoints")
+	local c2s = ep and ep:FindFirstChild("client_to_server")
+	return c2s and c2s:FindFirstChild("request_token_trait_reroll") or nil
 end
 
 local function refreshUI()
 	if destroyed or not ui.main then
 		return
 	end
-	local traitNow = readCurrentTrait()
+	scanGuiState()
 	pcall(function()
 		ui.statusLabel.Text = string.format(
-			"Zero-Hook | Armed: %s | Tokens: %s | Trait: %s",
-			state.armed and "YES" or "NO",
-			tostring(state.lastTokens),
-			tostring(traitNow)
+			"v2.0 Active Trial | Zero-Hook | Monitor: %s | Trials: %d | RaceDelay: %dms",
+			state.armed and "ON" or "OFF",
+			state.trialCount,
+			state.raceDelayMs
 		)
-		ui.summaryBox.Text = table.concat({
-			"=== TEST #3: POST-EXIT STATE CONSISTENCY ===",
-			"Unit GUID: " .. tostring(state.lastUnitId),
-			"Observed Tokens: " .. tostring(state.lastTokens) .. "  |  Current Trait: " .. tostring(traitNow),
+		ui.boardBox.Text = table.concat({
+			string.format("Unit: %s | GUID: %s", tostring(state.unitName), tostring(state.unitGuid)),
+			string.format("Live Trait: %s | Real Tokens: %s | Curse Tokens: %s", tostring(state.liveTrait), tostring(state.liveTokens), tostring(state.curseTokens)),
+			"Stats: " .. tostring(state.statPreview),
+			state.verdict,
 		}, "\n")
-		ui.armBtn.Text = state.armed and "1. Watch: ON (Click to Pause)" or "1. Start Watch"
-		ui.armBtn.BackgroundColor3 = state.armed and C.good or C.accent
+
+		ui.armBtn.Text = state.armed and "1. Monitor: ON" or "1. Monitor: OFF"
+		ui.armBtn.BackgroundColor3 = state.armed and C.good or C.btn
+		ui.delayBtn.Text = string.format("Delay: %dms", state.raceDelayMs)
 
 		local view = {}
 		for i = math.max(1, #state.logs - 16), #state.logs do
 			view[#view + 1] = state.logs[i]
 		end
-		ui.logBox.Text = (#view > 0) and table.concat(view, "\n") or "Ready. Start Watch, do 1 reroll, copy pre-exit report, then Rejoin and check."
+		ui.logBox.Text = (#view > 0) and table.concat(view, "\n") or "Ready."
 	end)
 end
 
-local function bindListeners()
+local function bindPassiveWatchers()
 	if ReplicatedStorage then
 		local ep = ReplicatedStorage:FindFirstChild("endpoints")
 		local s2c = ep and ep:FindFirstChild("server_to_client")
 		if s2c then
 			local tokEv = s2c:FindFirstChild("token_trait_reroll_amount_changed")
 			if tokEv and tokEv:IsA("RemoteEvent") then
-				trackConn(tokEv.OnClientEvent:Connect(function(amount, ...)
+				trackConn(tokEv.OnClientEvent:Connect(function(amount)
 					if destroyed or not state.armed then
 						return
 					end
-					state.lastTokens = tostring(amount)
-					addLog("TOKEN_SYNC", "token_trait_reroll_amount_changed -> " .. state.lastTokens)
+					state.lastSyncClock = os.clock()
+					state.liveTokens = tostring(amount)
+					addLog("S2C_TOKEN", "Server Trait Tokens = " .. state.liveTokens)
+					refreshUI()
+				end))
+			end
+
+			local curseEv = s2c:FindFirstChild("token_curse_reroll_amount_changed")
+			if curseEv and curseEv:IsA("RemoteEvent") then
+				trackConn(curseEv.OnClientEvent:Connect(function(amount)
+					if destroyed or not state.armed then
+						return
+					end
+					state.curseTokens = tostring(amount)
+					addLog("S2C_CURSE", "Server Curse Tokens = " .. state.curseTokens)
 					refreshUI()
 				end))
 			end
 
 			local traitEv = s2c:FindFirstChild("unit_traits_changed")
 			if traitEv and traitEv:IsA("RemoteEvent") then
-				trackConn(traitEv.OnClientEvent:Connect(function(unitId, payload, ...)
+				trackConn(traitEv.OnClientEvent:Connect(function(unitId)
 					if destroyed or not state.armed then
 						return
 					end
+					state.trialCount += 1
 					if unitId ~= nil then
-						state.lastUnitId = tostring(unitId)
+						state.unitGuid = tostring(unitId)
 					end
-					local pInfo = typeof(payload) == "table" and "table" or tostring(payload)
+					local dtMs = state.lastSyncClock > 0 and ((os.clock() - state.lastSyncClock) * 1000) or 0
 					task.defer(function()
 						task.wait(0.05)
-						local trNow = readCurrentTrait()
-						addLog("UNIT_TRAIT_SYNC", string.format("Unit=%s (%s) | Trait=%q | Tokens=%s", state.lastUnitId, pInfo, trNow, state.lastTokens))
+						scanGuiState()
+						addLog(
+							"TRIAL_COMMIT",
+							string.format(
+								"Trial #%d | Unit=%s (%s) | Trait=%q | Tokens=%s | Delta=%.1fms",
+								state.trialCount,
+								state.unitName,
+								state.unitGuid,
+								state.liveTrait,
+								state.liveTokens,
+								dtMs
+							)
+						)
 						refreshUI()
 					end)
 				end))
@@ -154,35 +364,74 @@ local function bindListeners()
 	local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
 	local tr = pg and pg:FindFirstChild("TraitReroll")
 	if tr then
-		local function hookText(obj)
+		local function watchText(obj)
 			if obj:IsA("TextLabel") and obj.Name == "CurrentTraitText" then
 				trackConn(obj:GetPropertyChangedSignal("Text"):Connect(function()
 					if destroyed or not state.armed then
 						return
 					end
-					state.lastTrait = obj.Text
-					addLog("UI_TRAIT", "CurrentTraitText -> " .. tostring(obj.Text))
+					state.liveTrait = obj.Text
+					addLog("UI_SYNC", "CurrentTraitText -> " .. tostring(obj.Text))
 					refreshUI()
 				end))
 			end
 		end
 		for _, d in ipairs(tr:GetDescendants()) do
-			hookText(d)
+			watchText(d)
 		end
 		trackConn(tr.DescendantAdded:Connect(function(d)
-			hookText(d)
+			watchText(d)
 			if not destroyed and state.armed and d:IsA("TextLabel") and d.Name == "CurrentTraitText" then
-				state.lastTrait = d.Text
-				addLog("UI_REBUILT", "CurrentTraitText -> " .. tostring(d.Text))
+				state.liveTrait = d.Text
+				addLog("UI_REBUILD", "CurrentTraitText rebuilt -> " .. tostring(d.Text))
 				refreshUI()
 			end
 		end))
 	end
-
-	addLog("INIT", "Test #3 zero-hook listeners ready.")
 end
 
-local function cleanupTest()
+local function executeRollbackRaceTrial()
+	scanGuiState()
+	local cp = saveCheckpointNow("PRE_RACE")
+	local remote = getRerollEndpoint()
+
+	if not remote then
+		addLog("ERROR", "request_token_trait_reroll endpoint not found.")
+		refreshUI()
+		return
+	end
+
+	if cp.unitGuid == "Unknown" or cp.unitGuid == "" then
+		addLog("WARN", "Unit GUID unknown yet! Do 1 manual reroll first so GUID is captured, then run Race Trial.")
+		state.verdict = "Action needed: Do 1 normal reroll first so the script captures your Unit GUID."
+		refreshUI()
+		return
+	end
+
+	addLog("RACE_START", string.format("Invoking reroll on %s, then triggering Rejoin after %dms...", cp.unitGuid, state.raceDelayMs))
+	refreshUI()
+
+	-- Fire reroll asynchronously without blocking the race timer
+	task.spawn(function()
+		pcall(function()
+			if remote:IsA("RemoteFunction") then
+				remote:InvokeServer(cp.unitGuid)
+			elseif remote:IsA("RemoteEvent") then
+				remote:FireServer(cp.unitGuid)
+			end
+		end)
+	end)
+
+	-- Wait exact race window in ms, then trigger teleport/rejoin
+	if state.raceDelayMs > 0 then
+		task.wait(state.raceDelayMs / 1000)
+	else
+		task.wait()
+	end
+	triggerRejoin(true)
+end
+
+local function cleanupApp()
 	if destroyed then
 		return
 	end
@@ -204,15 +453,15 @@ end
 
 local function buildUI()
 	ui.screenGui = Instance.new("ScreenGui")
-	ui.screenGui.Name = TEST_TAG
+	ui.screenGui.Name = APP_TAG
 	ui.screenGui.ResetOnSpawn = false
 	ui.screenGui.IgnoreGuiInset = true
-	ui.screenGui.DisplayOrder = 145
+	ui.screenGui.DisplayOrder = 155
 
 	ui.main = Instance.new("Frame")
 	ui.main.Name = "Main"
-	ui.main.Size = UDim2.new(0, 500, 0, 390)
-	ui.main.Position = UDim2.new(0.5, -250, 0.5, -195)
+	ui.main.Size = UDim2.new(0, 550, 0, 455)
+	ui.main.Position = UDim2.new(0.5, -275, 0.5, -227)
 	ui.main.BackgroundColor3 = C.bg
 	ui.main.BorderSizePixel = 0
 	ui.main.Parent = ui.screenGui
@@ -233,7 +482,7 @@ local function buildUI()
 	title.Font = Enum.Font.GothamBold
 	title.TextSize = 14
 	title.TextXAlignment = Enum.TextXAlignment.Left
-	title.Text = "TEST #3: POST-EXIT STATE CONSISTENCY"
+	title.Text = "ROLLBACK LAB v2.0 — ACTIVE TRIAL, RACE & REJOIN ENGINE"
 	title.Parent = ui.dragBar
 
 	ui.closeBtn = Instance.new("TextButton")
@@ -258,20 +507,20 @@ local function buildUI()
 	ui.statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 	ui.statusLabel.Parent = ui.main
 
-	ui.summaryBox = Instance.new("TextLabel")
-	ui.summaryBox.Size = UDim2.new(1, -24, 0, 64)
-	ui.summaryBox.Position = UDim2.new(0, 12, 0, 62)
-	ui.summaryBox.BackgroundColor3 = C.card
-	ui.summaryBox.BorderSizePixel = 0
-	ui.summaryBox.TextColor3 = C.text
-	ui.summaryBox.Font = Enum.Font.Code
-	ui.summaryBox.TextSize = 12
-	ui.summaryBox.TextXAlignment = Enum.TextXAlignment.Left
-	ui.summaryBox.TextYAlignment = Enum.TextYAlignment.Top
-	ui.summaryBox.TextWrapped = true
-	ui.summaryBox.Parent = ui.main
-	Instance.new("UICorner", ui.summaryBox).CornerRadius = UDim.new(0, 6)
-	local p1 = Instance.new("UIPadding", ui.summaryBox)
+	ui.boardBox = Instance.new("TextLabel")
+	ui.boardBox.Size = UDim2.new(1, -24, 0, 82)
+	ui.boardBox.Position = UDim2.new(0, 12, 0, 62)
+	ui.boardBox.BackgroundColor3 = C.card
+	ui.boardBox.BorderSizePixel = 0
+	ui.boardBox.TextColor3 = C.text
+	ui.boardBox.Font = Enum.Font.Code
+	ui.boardBox.TextSize = 12
+	ui.boardBox.TextXAlignment = Enum.TextXAlignment.Left
+	ui.boardBox.TextYAlignment = Enum.TextYAlignment.Top
+	ui.boardBox.TextWrapped = true
+	ui.boardBox.Parent = ui.main
+	Instance.new("UICorner", ui.boardBox).CornerRadius = UDim.new(0, 6)
+	local p1 = Instance.new("UIPadding", ui.boardBox)
 	p1.PaddingLeft = UDim.new(0, 8)
 	p1.PaddingTop = UDim.new(0, 6)
 
@@ -290,13 +539,21 @@ local function buildUI()
 		return b
 	end
 
-	ui.armBtn = makeBtn("1. Start Watch", 12, 134, 165, C.accent)
-	ui.snapBtn = makeBtn("2. Mark Pre-Exit", 183, 134, 155, C.btn)
-	ui.copyBtn = makeBtn("Copy Test #3 Log", 344, 134, 144, C.btn)
+	-- Row 1: Measurement & Checkpoint
+	ui.armBtn = makeBtn("1. Monitor: ON", 12, 152, 125, C.good)
+	ui.saveBtn = makeBtn("2. Save Checkpoint", 143, 152, 132, C.accent)
+	ui.cmpBtn = makeBtn("3. Compare Rejoin", 281, 152, 132, C.btn)
+	ui.copyBtn = makeBtn("Copy Report", 419, 152, 119, C.btn)
+
+	-- Row 2: Active Rollback Race Trial & Rejoin Controls
+	ui.raceBtn = makeBtn("4. Run Rollback Race Trial", 12, 186, 195, C.danger)
+	ui.delayBtn = makeBtn("Delay: 15ms", 213, 186, 95, C.btn)
+	ui.rejoinBtn = makeBtn("5. Rejoin Server", 314, 186, 112, C.warn)
+	ui.rejoinNewBtn = makeBtn("Rejoin New", 432, 186, 106, C.btn)
 
 	ui.logBox = Instance.new("TextBox")
-	ui.logBox.Size = UDim2.new(1, -24, 0, 210)
-	ui.logBox.Position = UDim2.new(0, 12, 0, 170)
+	ui.logBox.Size = UDim2.new(1, -24, 0, 222)
+	ui.logBox.Position = UDim2.new(0, 12, 0, 222)
 	ui.logBox.BackgroundColor3 = C.panel
 	ui.logBox.BorderSizePixel = 0
 	ui.logBox.TextColor3 = C.text
@@ -315,27 +572,63 @@ local function buildUI()
 end
 
 local function bindEvents()
-	trackConn(ui.closeBtn.Activated:Connect(cleanupTest))
+	trackConn(ui.closeBtn.Activated:Connect(cleanupApp))
+
 	trackConn(ui.armBtn.Activated:Connect(function()
 		state.armed = not state.armed
-		addLog("STATE", state.armed and "Watch ON: perform 1 reroll." or "Watch PAUSED.")
+		addLog("MODE", state.armed and "Monitor enabled." or "Monitor paused.")
 		refreshUI()
 	end))
-	trackConn(ui.snapBtn.Activated:Connect(function()
-		local tr = readCurrentTrait()
-		addLog("PRE_EXIT_MARK", string.format("Unit=%s | Tokens=%s | Trait=%q", state.lastUnitId, state.lastTokens, tr))
+
+	trackConn(ui.saveBtn.Activated:Connect(function()
+		saveCheckpointNow("MANUAL")
 		refreshUI()
 	end))
+
+	trackConn(ui.cmpBtn.Activated:Connect(function()
+		evaluateAgainstCheckpoint()
+		refreshUI()
+	end))
+
+	trackConn(ui.raceBtn.Activated:Connect(function()
+		executeRollbackRaceTrial()
+	end))
+
+	local delaySteps = { 0, 5, 15, 30, 60 }
+	trackConn(ui.delayBtn.Activated:Connect(function()
+		local idx = 1
+		for i, v in ipairs(delaySteps) do
+			if v == state.raceDelayMs then
+				idx = (i % #delaySteps) + 1
+				break
+			end
+		end
+		state.raceDelayMs = delaySteps[idx]
+		addLog("CONFIG", string.format("Race Rejoin delay set to %dms.", state.raceDelayMs))
+		refreshUI()
+	end))
+
+	trackConn(ui.rejoinBtn.Activated:Connect(function()
+		saveCheckpointNow("PRE_REJOIN")
+		triggerRejoin(false)
+	end))
+
+	trackConn(ui.rejoinNewBtn.Activated:Connect(function()
+		saveCheckpointNow("PRE_NEW_SRV")
+		triggerRejoin(true)
+	end))
+
 	trackConn(ui.copyBtn.Activated:Connect(function()
+		scanGuiState()
 		local header = {
-			"=== TEST #3 REPORT: POST-EXIT STATE CONSISTENCY ===",
+			"=== ROLLBACK LAB v2.0 — ACTIVE TRIAL & RACE REPORT ===",
 			ui.statusLabel.Text,
-			ui.summaryBox.Text,
+			ui.boardBox.Text,
 			"--- LOGS ---",
 		}
 		local full = table.concat(header, "\n") .. "\n" .. table.concat(state.logs, "\n")
 		local ok = setClipboardSafe(full)
-		addLog("EXPORT", ok and "Copied Test #3 report." or "Clipboard unavailable.")
+		addLog("EXPORT", ok and "Copied v2.0 report to clipboard." or "Clipboard unavailable.")
 		refreshUI()
 	end))
 
@@ -369,7 +662,7 @@ if type(prev) == "table" and type(prev.destroy) == "function" then
 end
 pcall(function()
 	if type(_G) == "table" then
-		_G[GUARD_KEY] = { destroy = cleanupTest }
+		_G[GUARD_KEY] = { destroy = cleanupApp }
 	end
 end)
 
@@ -391,6 +684,20 @@ task.defer(function()
 	buildUI()
 	bindEvents()
 	ui.screenGui.Parent = parent
-	bindListeners()
+	bindPassiveWatchers()
+	scanGuiState()
+
+	local existingCp = readCheckpointFile()
+	if existingCp then
+		state.savedCheckpoint = existingCp
+		if existingCp.unitGuid and existingCp.unitGuid ~= "Unknown" then
+			state.unitGuid = existingCp.unitGuid
+		end
+		addLog("BOOT", string.format("Restored Checkpoint: Unit=%s | Trait=%s | Tokens=%s", tostring(existingCp.unitName), tostring(existingCp.trait), tostring(existingCp.tokens)))
+		evaluateAgainstCheckpoint()
+	else
+		addLog("BOOT", "Rollback Lab v2.0 initialized (Active Race Trial + Zero-Hook Monitor).")
+	end
+
 	refreshUI()
 end)
