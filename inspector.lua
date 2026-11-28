@@ -12,9 +12,9 @@ local CoreGui = getServiceSafe("CoreGui")
 local UserInputService = getServiceSafe("UserInputService")
 local HttpService = getServiceSafe("HttpService")
 
-local APP_TAG = "RollbackLab_PreRollArm_v3_1"
+local APP_TAG = "RollbackLab_SessionEntity_v3_2"
 local GUARD_KEY = "__LiveTrialGuard_" .. APP_TAG
-local BASE_FILE = "RollbackLab_v3_1_PreRollBase.json"
+local ENTITY_FILE = "RollbackLab_v3_2_SessionEntity.json"
 
 local connections = {}
 local destroyed = false
@@ -35,15 +35,16 @@ local C = {
 
 local state = {
 	armed = false,
-	armSeq = 0,
-	rollsSinceArm = 0,
+	sessionCounter = 0,
+	rollsInSession = 0,
 	exitMethod = "KICK_TP", -- KICK_TP | SHUTDOWN | TELEPORT
 	unitGuid = "Unknown",
 	unitName = "Unknown",
 	liveTrait = "N/A",
 	liveTokens = "Unknown",
-	preRollBase = nil, -- Locked Pre-Roll Base saved before rolling
-	verdict = "Click [1. ARM PRE-ROLL BASE] BEFORE rolling to lock your pre-roll base.",
+	guiOpen = false,
+	sessionEntity = nil, -- Full Pre-Open Session Entity
+	verdict = "Step 1: Click [1. ARM OPEN ENTITY] before opening/rolling.",
 	logs = {},
 }
 
@@ -72,30 +73,30 @@ local function setClipboardSafe(text)
 	return type(fn) == "function" and pcall(fn, text) or false
 end
 
-local function writeBaseFile(tbl)
+local function writeEntityFile(tbl)
 	local writeFn = findExecutorFn("writefile")
 	if type(writeFn) == "function" and HttpService then
 		local okEnc, json = pcall(function()
 			return HttpService:JSONEncode(tbl)
 		end)
 		if okEnc and json then
-			return pcall(writeFn, BASE_FILE, json)
+			return pcall(writeFn, ENTITY_FILE, json)
 		end
 	end
 	return false
 end
 
-local function readBaseFile()
+local function readEntityFile()
 	local readFn = findExecutorFn("readfile")
 	local isFileFn = findExecutorFn("isfile")
 	if type(readFn) == "function" and HttpService then
 		if type(isFileFn) == "function" then
-			local okEx, ex = pcall(isFileFn, BASE_FILE)
+			local okEx, ex = pcall(isFileFn, ENTITY_FILE)
 			if not (okEx and ex) then
 				return nil
 			end
 		end
-		local okRead, raw = pcall(readFn, BASE_FILE)
+		local okRead, raw = pcall(readFn, ENTITY_FILE)
 		if okRead and type(raw) == "string" and raw ~= "" then
 			local okDec, tbl = pcall(function()
 				return HttpService:JSONDecode(raw)
@@ -108,17 +109,17 @@ local function readBaseFile()
 	return nil
 end
 
-local function clearBaseFile()
+local function clearEntityFile()
 	local delFn = findExecutorFn("delfile")
 	local isFileFn = findExecutorFn("isfile")
 	if type(delFn) == "function" then
 		local exists = true
 		if type(isFileFn) == "function" then
-			local okEx, ex = pcall(isFileFn, BASE_FILE)
+			local okEx, ex = pcall(isFileFn, ENTITY_FILE)
 			exists = okEx and ex
 		end
 		if exists then
-			pcall(delFn, BASE_FILE)
+			pcall(delFn, ENTITY_FILE)
 		end
 	end
 end
@@ -140,6 +141,7 @@ local function scanGuiState()
 
 	local tr = pg:FindFirstChild("TraitReroll")
 	if tr then
+		state.guiOpen = (tr:IsA("ScreenGui") and tr.Enabled) or false
 		local cur = tr:FindFirstChild("CurrentTraitText", true)
 		if cur and cur:IsA("TextLabel") and cur.Text ~= "" then
 			state.liveTrait = cur.Text
@@ -181,31 +183,33 @@ local function refreshUI()
 	end
 	pcall(scanGuiState)
 	pcall(function()
+		local entId = state.sessionEntity and tostring(state.sessionEntity.sessionId) or "NONE"
 		ui.statusLabel.Text = string.format(
-			"v3.1 Pre-Roll Arm | Armed:%s (Arm#%d) | RollsAfterArm:%d | Cut:%s",
-			state.armed and "LOCKED" or "OFF",
-			state.armSeq,
-			state.rollsSinceArm,
+			"v3.2 Entity Gate | State:%s | Entity:%s | Rolls:%d | Cut:%s",
+			state.armed and "ARMED" or "STANDBY",
+			entId,
+			state.rollsInSession,
 			state.exitMethod
 		)
 
-		local baseStr = "None (Not Armed Before Roll)"
-		if state.preRollBase then
-			baseStr = string.format(
-				"#%d [%s | Tok=%s]",
-				tonumber(state.preRollBase.armSeq) or 0,
-				tostring(state.preRollBase.trait),
-				tostring(state.preRollBase.tokens)
+		local entSummary = "No Pre-Open Session Entity Saved"
+		if state.sessionEntity then
+			entSummary = string.format(
+				"%s [Trait=%s | Tok=%s | Gui=%s]",
+				tostring(state.sessionEntity.sessionId),
+				tostring(state.sessionEntity.preOpenTrait),
+				tostring(state.sessionEntity.preOpenTokens),
+				tostring(state.sessionEntity.guiOpenAtArm)
 			)
 		end
 
 		ui.boardBox.Text = table.concat({
 			string.format("Unit: %s | GUID: %s", tostring(state.unitName), tostring(state.unitGuid)),
-			string.format("Post-Roll Now: [%s | Tok=%s]  ||  Pre-Roll Base: %s", tostring(state.liveTrait), tostring(state.liveTokens), baseStr),
+			string.format("Now: [%s | Tok=%s]  ||  Entity: %s", tostring(state.liveTrait), tostring(state.liveTokens), entSummary),
 			state.verdict,
 		}, "\n")
 
-		ui.armBtn.Text = state.armed and string.format("1. BASE LOCKED (#%d)", state.armSeq) or "1. ARM PRE-ROLL BASE"
+		ui.armBtn.Text = state.armed and ("1. ENTITY ARMED (" .. entId .. ")") or "1. ARM OPEN ENTITY"
 		ui.armBtn.BackgroundColor3 = state.armed and C.warn or C.accent
 		ui.modeBtn.Text = "Cut: " .. state.exitMethod
 
@@ -217,52 +221,52 @@ local function refreshUI()
 	end)
 end
 
-local function armPreRollBase()
+local function armOpenSessionEntity()
 	pcall(scanGuiState)
-	state.armSeq += 1
-	state.rollsSinceArm = 0
-	local base = {
-		armSeq = state.armSeq,
+	state.sessionCounter += 1
+	state.rollsInSession = 0
+
+	local entity = {
+		sessionId = string.format("SES-%03d", state.sessionCounter),
+		armedAt = os.time(),
 		unitGuid = tostring(state.unitGuid),
 		unitName = tostring(state.unitName),
-		trait = tostring(state.liveTrait),
-		tokens = tostring(state.liveTokens),
-		armedAt = os.time(),
+		preOpenTrait = tostring(state.liveTrait),
+		preOpenTokens = tostring(state.liveTokens),
+		guiOpenAtArm = state.guiOpen,
+		confirmedRollback = false,
 	}
-	state.preRollBase = base
+
+	state.sessionEntity = entity
 	state.armed = true
-	local savedDisk = writeBaseFile(base)
+	local savedDisk = writeEntityFile(entity)
+
 	state.verdict = string.format(
-		"PRE-ROLL BASE #%d LOCKED (%s): [%s | Tok=%s]. Roll manually now, then Confirm Rollback or Keep!",
-		state.armSeq,
+		"OPEN ENTITY %s LOCKED (%s): [%s | Tok=%s]. Open/roll manually, then Confirm Rollback or Keep!",
+		entity.sessionId,
 		savedDisk and "Disk+RAM" or "RAM",
-		base.trait,
-		base.tokens
+		entity.preOpenTrait,
+		entity.preOpenTokens
 	)
-	addLog("ARM_BASE", state.verdict)
+	addLog("ARM_ENTITY", state.verdict)
 	refreshUI()
 end
 
-local function keepPostRollResult()
+local function keepSessionResult()
 	pcall(scanGuiState)
+	local prevId = state.sessionEntity and tostring(state.sessionEntity.sessionId) or "NONE"
 	state.armed = false
-	state.rollsSinceArm = 0
-	state.preRollBase = nil
-	clearBaseFile()
-	state.verdict = string.format("KEPT RESULT: Cleared Pre-Roll Base & accepted [%s | Tok=%s].", tostring(state.liveTrait), tostring(state.liveTokens))
-	addLog("KEEP_RESULT", state.verdict)
+	state.rollsInSession = 0
+	state.sessionEntity = nil
+	clearEntityFile()
+	state.verdict = string.format("KEPT (%s): Released entity & accepted [%s | Tok=%s].", prevId, tostring(state.liveTrait), tostring(state.liveTokens))
+	addLog("KEEP_ENTITY", state.verdict)
 	refreshUI()
 end
 
 local function executeSessionCut(method)
 	local lp = Players and Players.LocalPlayer
-	if method == "TELEPORT" then
-		if TeleportService and lp then
-			pcall(function()
-				TeleportService:Teleport(game.PlaceId, lp)
-			end)
-		end
-	elseif method == "KICK_TP" then
+	if method == "KICK_TP" then
 		if TeleportService and lp then
 			task.spawn(function()
 				pcall(function()
@@ -271,37 +275,60 @@ local function executeSessionCut(method)
 			end)
 			task.wait(0.02)
 			pcall(function()
-				lp:Kick("RollbackLab v3.1 Pre-Roll Rollback Cut")
+				lp:Kick("RollbackLab v3.2 Session Entity Cut")
 			end)
 		end
 	elseif method == "SHUTDOWN" then
 		pcall(function()
 			game:Shutdown()
 		end)
+	elseif method == "TELEPORT" then
+		if TeleportService and lp then
+			pcall(function()
+				TeleportService:Teleport(game.PlaceId, lp)
+			end)
+		end
 	end
 end
 
-local function confirmPreRollRollback()
+local function confirmPreOpenAssertionAndCut()
 	pcall(scanGuiState)
-	local base = state.preRollBase or readBaseFile()
-	if not base then
-		state.verdict = "ERROR: No Pre-Roll Base was armed before rolling! Click [1. ARM PRE-ROLL BASE] first."
-		addLog("CONFIRM_ERR", "Missing Pre-Roll Base.")
+	local ent = state.sessionEntity or readEntityFile()
+
+	-- Assert 1: Pre-open entity must exist
+	if not ent then
+		state.verdict = "ASSERTION FAILED: No Pre-Open Session Entity was armed before opening/rolling!"
+		addLog("ASSERT_FAIL", "Missing Pre-Open Session Entity.")
 		refreshUI()
 		return
 	end
 
-	state.preRollBase = base
-	writeBaseFile(base)
+	-- Assert 2: Match unit GUID if both are known
+	if ent.unitGuid and ent.unitGuid ~= "Unknown" and state.unitGuid ~= "Unknown" and ent.unitGuid ~= state.unitGuid then
+		state.verdict = string.format("ASSERTION MISMATCH: Armed GUID [%s] != Current GUID [%s]", tostring(ent.unitGuid), tostring(state.unitGuid))
+		addLog("ASSERT_MISMATCH", state.verdict)
+		refreshUI()
+		return
+	end
+
+	ent.confirmedRollback = true
+	ent.confirmedAt = os.time()
+	ent.postRollTraitAtConfirm = tostring(state.liveTrait)
+	ent.postRollTokensAtConfirm = tostring(state.liveTokens)
+	ent.rollsObserved = state.rollsInSession
+	state.sessionEntity = ent
+	writeEntityFile(ent)
+
 	addLog(
-		"CONFIRM_RB",
+		"ASSERT_OK",
 		string.format(
-			"Confirming Rollback to Base #%d [%s, Tok=%s] from Post-Roll [%s, Tok=%s] via %s...",
-			tonumber(base.armSeq) or 0,
-			tostring(base.trait),
-			tostring(base.tokens),
+			"Assertion Passed for %s! PreOpen=[%s, Tok=%s] | PostRoll=[%s, Tok=%s] | Rolls=%d -> Cutting via %s...",
+			tostring(ent.sessionId),
+			tostring(ent.preOpenTrait),
+			tostring(ent.preOpenTokens),
 			tostring(state.liveTrait),
 			tostring(state.liveTokens),
+			state.rollsInSession,
 			state.exitMethod
 		)
 	)
@@ -309,37 +336,37 @@ local function confirmPreRollRollback()
 	executeSessionCut(state.exitMethod)
 end
 
-local function verifyAgainstPreRollBase()
+local function verifySessionContract()
 	pcall(scanGuiState)
-	local base = state.preRollBase or readBaseFile()
-	if not base then
-		state.verdict = "No Pre-Roll Base found to compare against."
-		addLog("VERIFY", "No Pre-Roll Base found.")
+	local ent = state.sessionEntity or readEntityFile()
+	if not ent then
+		state.verdict = "No Session Entity found to verify."
+		addLog("VERIFY", "No Session Entity found.")
 		refreshUI()
 		return
 	end
 
-	state.preRollBase = base
-	local preTrait = tostring(base.trait)
+	state.sessionEntity = ent
+	local preTrait = tostring(ent.preOpenTrait)
 	local nowTrait = tostring(state.liveTrait)
-	local preTok = tostring(base.tokens)
+	local preTok = tostring(ent.preOpenTokens)
 	local nowTok = tostring(state.liveTokens)
 
 	if preTrait == nowTrait and (preTok == "Unknown" or preTok == nowTok) then
 		state.verdict = string.format(
-			"VERDICT: ROLLBACK MATCHED PRE-ROLL BASE #%d! [%s | Tok=%s]",
-			tonumber(base.armSeq) or 0,
+			"CONTRACT FULFILLED (%s): True Rollback to Pre-Open Entity [%s | Tok=%s]",
+			tostring(ent.sessionId),
 			preTrait,
 			preTok
 		)
 	else
 		state.verdict = string.format(
-			"VERDICT: SERVER COMMITTED NEW STATE | Pre-Roll Base #%d:[%s, Tok=%s] -> Now:[%s, Tok=%s]",
-			tonumber(base.armSeq) or 0,
-			preTrait,
-			preTok,
+			"CONTRACT BROKEN (%s): Server Committed [%s, Tok=%s] over Pre-Open [%s, Tok=%s]",
+			tostring(ent.sessionId),
 			nowTrait,
-			nowTok
+			nowTok,
+			preTrait,
+			preTok
 		)
 	end
 	addLog("VERIFY", state.verdict)
@@ -373,17 +400,17 @@ local function bindPassiveWatchers()
 						state.unitGuid = tostring(unitId)
 					end
 					if state.armed then
-						state.rollsSinceArm += 1
+						state.rollsInSession += 1
 					end
 					task.defer(function()
 						task.wait(0.05)
 						pcall(scanGuiState)
 						addLog(
-							"POST_ARM_ROLL",
+							"SESSION_ROLL",
 							string.format(
-								"Roll #%d after Arm#%d -> Trait=%q | Tokens=%s",
-								state.rollsSinceArm,
-								state.armSeq,
+								"Roll #%d in %s -> Trait=%q | Tokens=%s",
+								state.rollsInSession,
+								state.sessionEntity and tostring(state.sessionEntity.sessionId) or "UNARMED",
 								state.liveTrait,
 								state.liveTokens
 							)
@@ -399,6 +426,16 @@ local function bindPassiveWatchers()
 	local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
 	local tr = pg and pg:FindFirstChild("TraitReroll")
 	if tr then
+		if tr:IsA("ScreenGui") then
+			trackConn(tr:GetPropertyChangedSignal("Enabled"):Connect(function()
+				if destroyed then
+					return
+				end
+				state.guiOpen = tr.Enabled
+				addLog("GUI_OPEN", "TraitReroll Enabled = " .. tostring(tr.Enabled))
+				refreshUI()
+			end))
+		end
 		local function watchText(obj)
 			if obj:IsA("TextLabel") and obj.Name == "CurrentTraitText" then
 				trackConn(obj:GetPropertyChangedSignal("Text"):Connect(function()
@@ -457,12 +494,12 @@ local function buildUI()
 	ui.screenGui.Name = APP_TAG
 	ui.screenGui.ResetOnSpawn = false
 	ui.screenGui.IgnoreGuiInset = true
-	ui.screenGui.DisplayOrder = 185
+	ui.screenGui.DisplayOrder = 190
 
 	ui.main = Instance.new("Frame")
 	ui.main.Name = "Main"
-	ui.main.Size = UDim2.new(0, 575, 0, 445)
-	ui.main.Position = UDim2.new(0.5, -287, 0.5, -222)
+	ui.main.Size = UDim2.new(0, 580, 0, 445)
+	ui.main.Position = UDim2.new(0.5, -290, 0.5, -222)
 	ui.main.BackgroundColor3 = C.bg
 	ui.main.BorderSizePixel = 0
 	ui.main.Parent = ui.screenGui
@@ -483,7 +520,7 @@ local function buildUI()
 	title.Font = Enum.Font.GothamBold
 	title.TextSize = 14
 	title.TextXAlignment = Enum.TextXAlignment.Left
-	title.Text = "ROLLBACK LAB v3.1 — TRUE PRE-ROLL ARM BASE ENGINE"
+	title.Text = "ROLLBACK LAB v3.2 — OPEN SESSION ENTITY & ASSERTION"
 	title.Parent = ui.dragBar
 
 	ui.closeBtn = Instance.new("TextButton")
@@ -540,13 +577,13 @@ local function buildUI()
 		return b
 	end
 
-	ui.armBtn = makeBtn("1. ARM PRE-ROLL BASE", 12, 144, 152, C.accent)
-	ui.confirmBtn = makeBtn("2A. CONFIRM ROLLBACK", 170, 144, 156, C.danger)
-	ui.keepBtn = makeBtn("2B. KEEP RESULT", 332, 144, 114, C.good)
-	ui.verifyBtn = makeBtn("3. VERIFY BASE", 452, 144, 111, C.btn)
+	ui.armBtn = makeBtn("1. ARM OPEN ENTITY", 12, 144, 150, C.accent)
+	ui.confirmBtn = makeBtn("2A. CONFIRM & ASSERT", 168, 144, 162, C.danger)
+	ui.keepBtn = makeBtn("2B. KEEP ENTITY", 336, 144, 114, C.good)
+	ui.verifyBtn = makeBtn("3. VERIFY CONTRACT", 456, 144, 112, C.btn)
 
 	ui.modeBtn = makeBtn("Cut: KICK_TP", 12, 180, 145, C.btn)
-	ui.copyBtn = makeBtn("Copy v3.1 Report", 163, 180, 400, C.btn)
+	ui.copyBtn = makeBtn("Copy v3.2 Entity Report", 163, 180, 405, C.btn)
 
 	ui.logBox = Instance.new("TextBox")
 	ui.logBox.Size = UDim2.new(1, -24, 0, 216)
@@ -570,10 +607,10 @@ end
 
 local function bindEvents()
 	bindSafeClick(ui.closeBtn, cleanupApp)
-	bindSafeClick(ui.armBtn, armPreRollBase)
-	bindSafeClick(ui.confirmBtn, confirmPreRollRollback)
-	bindSafeClick(ui.keepBtn, keepPostRollResult)
-	bindSafeClick(ui.verifyBtn, verifyAgainstPreRollBase)
+	bindSafeClick(ui.armBtn, armOpenSessionEntity)
+	bindSafeClick(ui.confirmBtn, confirmPreOpenAssertionAndCut)
+	bindSafeClick(ui.keepBtn, keepSessionResult)
+	bindSafeClick(ui.verifyBtn, verifySessionContract)
 
 	local methods = { "KICK_TP", "SHUTDOWN", "TELEPORT" }
 	bindSafeClick(ui.modeBtn, function()
@@ -592,14 +629,14 @@ local function bindEvents()
 	bindSafeClick(ui.copyBtn, function()
 		pcall(scanGuiState)
 		local header = {
-			"=== ROLLBACK LAB v3.1 — PRE-ROLL ARM REPORT ===",
+			"=== ROLLBACK LAB v3.2 — SESSION ENTITY REPORT ===",
 			ui.statusLabel.Text,
 			ui.boardBox.Text,
 			"--- LOGS ---",
 		}
 		local full = table.concat(header, "\n") .. "\n" .. table.concat(state.logs, "\n")
 		local ok = setClipboardSafe(full)
-		addLog("EXPORT", ok and "Copied v3.1 report to clipboard." or "Clipboard unavailable.")
+		addLog("EXPORT", ok and "Copied v3.2 report to clipboard." or "Clipboard unavailable.")
 		refreshUI()
 	end)
 
@@ -658,17 +695,16 @@ task.defer(function()
 	bindPassiveWatchers()
 	pcall(scanGuiState)
 
-	local existingBase = readBaseFile()
-	if existingBase then
-		state.preRollBase = existingBase
-		state.armSeq = tonumber(existingBase.armSeq) or state.armSeq
-		if existingBase.unitGuid and existingBase.unitGuid ~= "Unknown" then
-			state.unitGuid = existingBase.unitGuid
+	local existingEnt = readEntityFile()
+	if existingEnt then
+		state.sessionEntity = existingEnt
+		if existingEnt.unitGuid and existingEnt.unitGuid ~= "Unknown" then
+			state.unitGuid = existingEnt.unitGuid
 		end
-		addLog("BOOT", string.format("Loaded Pre-Roll Base #%d: %s | Tok=%s", state.armSeq, tostring(existingBase.trait), tostring(existingBase.tokens)))
-		verifyAgainstPreRollBase()
+		addLog("BOOT", string.format("Loaded Session Entity %s: [%s | Tok=%s]", tostring(existingEnt.sessionId), tostring(existingEnt.preOpenTrait), tostring(existingEnt.preOpenTokens)))
+		verifySessionContract()
 	else
-		addLog("BOOT", "Rollback Lab v3.1 ready. Arm Pre-Roll Base before rolling.")
+		addLog("BOOT", "Rollback Lab v3.2 ready. Arm Open Session Entity before opening/rolling.")
 	end
 
 	refreshUI()
