@@ -88,6 +88,16 @@ local NOISE_PATH_PATTERNS = {
 	"collection.grid.list.outer.unitframes",
 }
 
+local NOISE_EXACT_OR_SUFFIX = {
+	"rainbow",
+	"scaledampeningpercent",
+	"avatarpartscaletype",
+	"_root",
+	"_parent_folder",
+	"_player",
+	"spinning",
+}
+
 local VALUE_PROPS = {
 	Value = true, Text = true, Visible = true, Enabled = true,
 	Name = true, ClassName = true,
@@ -238,6 +248,19 @@ local function isNoisePath(pathLower)
 	return false
 end
 
+local function isLiveNoise(inst, pathLower)
+	if isNoisePath(pathLower) then
+		return true
+	end
+	local nameL = string.lower(tostring(propSafe(inst, "Name") or ""))
+	for _, n in ipairs(NOISE_EXACT_OR_SUFFIX) do
+		if nameL == n then
+			return true
+		end
+	end
+	return false
+end
+
 local function isRerollGuiPath(pathLower)
 	if not pathLower or pathLower == "" then
 		return false
@@ -266,6 +289,7 @@ end
 local function classifyPhase(rawLineLower, pathLower)
 	if string.find(rawLineLower, "[fn]", 1, true)
 		or string.find(rawLineLower, "[ev]", 1, true)
+		or string.find(pathLower, "endpoints", 1, true)
 	then
 		return "REROLL/REMOTE"
 	end
@@ -376,6 +400,7 @@ local function isRemoteKind(className)
 		or className == "RemoteFunction"
 		or className == "BindableEvent"
 		or className == "BindableFunction"
+		or className == "UnreliableRemoteEvent"
 end
 
 local function isValueKind(className)
@@ -396,6 +421,9 @@ local function targetWeight(inst)
 	local w = 0
 	if string.find(pathL, "endpoints", 1, true) then
 		w += 12
+	end
+	if string.find(nameL, "reroll_base_stats_all", 1, true) then
+		w += 15
 	end
 	if isRerollGuiPath(pathL) then
 		w += 9
@@ -549,7 +577,7 @@ local function renderRightBox()
 			"",
 		}
 		if #liveEvents == 0 then
-			lines[#lines + 1] = "Waiting for Remote calls or state changes..."
+			lines[#lines + 1] = "Waiting for stat reroll changes or endpoint events..."
 		else
 			for i = math.max(1, #liveEvents - 35), #liveEvents do
 				lines[#lines + 1] = liveEvents[i]
@@ -602,7 +630,7 @@ local function pushLiveEvent(inst, tagText)
 		return
 	end
 	local pathStr = fullPathSafe(inst)
-	if isNoisePath(string.lower(pathStr)) then
+	if isLiveNoise(inst, string.lower(pathStr)) then
 		return
 	end
 	local line = string.format(
@@ -1043,7 +1071,7 @@ local function insertEntry(inst)
 			end)
 		end
 
-		if isValueKind(info.className) then
+		if isValueKind(info.className) and not isLiveNoise(inst, pathL) then
 			local okSig, sig = pcall(function()
 				return inst:GetPropertyChangedSignal("Value")
 			end)
@@ -1165,7 +1193,7 @@ end
 local function buildFullReport()
 	local out = {
 		"=== RUNTIME INSPECTOR ROLLBACK ARCHITECTURE REPORT ===",
-		"Target Scope: Reroll Mechanics / Remotes & Endpoints / State & Attributes / Rollback Flow",
+		"Target Scope: Stat All Reroll / Remotes & Endpoints / State & Attributes / Rollback Flow",
 		"Mark #" .. tostring(markCounter) .. " | HookedRemotes: " .. tostring(safeCallsHooked) .. " | Inspected: " .. tostring(#inspectedHistory) .. " | Live: " .. tostring(#liveEvents),
 		"",
 		"--- [0A] HOOKED REMOTES INVENTORY ---",
@@ -1245,7 +1273,7 @@ local function buildFullReport()
 		if a.weight ~= b.weight then
 			return a.weight > b.weight
 		end
-		return tostring(a.fullName) < tostring(b.fullName)
+		return tostring(a.fullName) < tostring(a.fullName)
 	end)
 
 	local limit = math.min(#found, MAX_TARGET_HITS)
@@ -1837,7 +1865,7 @@ local function bindInspectorEvents()
 			if cls == "RemoteFunction" or cls == "RemoteEvent" or string.find(pathL, "endpoints", 1, true) then
 				hookSingleRemoteSafe(inst)
 			end
-			if isRemoteKind(cls) or isValueKind(cls) or isActionableRerollControl(inst, pathL) then
+			if not isLiveNoise(inst, pathL) and (isRemoteKind(cls) or isValueKind(cls) or isActionableRerollControl(inst, pathL)) then
 				pushLiveEvent(inst, "added")
 				applyViewFilter()
 			end
@@ -1851,7 +1879,8 @@ local function bindInspectorEvents()
 		if destroyed then
 			return
 		end
-		if isActionableRerollControl(inst, string.lower(fullPathSafe(inst))) then
+		local pathL = string.lower(fullPathSafe(inst))
+		if not isLiveNoise(inst, pathL) and isActionableRerollControl(inst, pathL) then
 			pushLiveEvent(inst, "removed")
 		end
 		removeEntry(inst)
