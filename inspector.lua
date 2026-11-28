@@ -10,7 +10,7 @@ local ReplicatedStorage = getServiceSafe("ReplicatedStorage")
 local CoreGui = getServiceSafe("CoreGui")
 local UserInputService = getServiceSafe("UserInputService")
 
-local TEST_TAG = "RollbackTest01_HypothesisProbe"
+local TEST_TAG = "RollbackTest02_StateVsUI"
 local GUARD_KEY = "__TestGuard_" .. TEST_TAG
 
 local connections = {}
@@ -32,8 +32,7 @@ local C = {
 
 local state = {
 	armed = false,
-	hookActive = false,
-	samples = {},
+	rerollCount = 0,
 	logs = {},
 }
 
@@ -71,123 +70,92 @@ end
 local function addLog(tag, msg)
 	local line = string.format("[%s | %.2fs] %s", tag, os.clock() % 1000, msg)
 	state.logs[#state.logs + 1] = line
-	if #state.logs > 70 then
+	if #state.logs > 80 then
 		table.remove(state.logs, 1)
 	end
 end
 
-local function getLiveTraitText()
+local function getTraitGuiSnapshot()
 	local lp = Players and Players.LocalPlayer
 	local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
 	local tr = pg and pg:FindFirstChild("TraitReroll")
-	local cur = tr and tr:FindFirstChild("CurrentTraitText", true)
+	if not tr then
+		return "TraitReroll=MISSING", "N/A"
+	end
+
+	local traitVal = "N/A"
+	local cur = tr:FindFirstChild("CurrentTraitText", true)
 	if cur and cur:IsA("TextLabel") then
-		return cur.Text
+		traitVal = cur.Text
 	end
-	return "N/A"
-end
 
-local function getEndpointsFolder()
-	if not ReplicatedStorage then
-		return nil
+	local qtyList = {}
+	for _, d in ipairs(tr:GetDescendants()) do
+		if d:IsA("TextLabel") and (d.Name == "Quantity" or d.Name == "Amount" or string.find(string.lower(d.Name), "token")) then
+			if d.Text ~= "" and d.Text ~= "Qt." then
+				qtyList[#qtyList + 1] = d.Name .. "=" .. tostring(d.Text)
+			end
+		end
 	end
-	local ep = ReplicatedStorage:FindFirstChild("endpoints")
-	return ep and ep:FindFirstChild("client_to_server") or nil
-end
 
-local function classifyLatency(ms)
-	if ms < 110 then
-		return "FAST (In-Memory RAM / Async Queue)"
-	elseif ms < 260 then
-		return "MODERATE (Server Processing / Validation)"
-	else
-		return "SLOW (Likely Synchronous DataStore Commit)"
-	end
+	local qtySummary = (#qtyList > 0) and table.concat(qtyList, ", ") or "NoQtyLabel"
+	return "Trait=" .. tostring(traitVal) .. " | " .. qtySummary, traitVal
 end
 
 local function refreshUI()
 	if destroyed or not ui.main then
 		return
 	end
-
-	local avgMs = 0
-	if #state.samples > 0 then
-		local sum = 0
-		for _, v in ipairs(state.samples) do
-			sum += v.ms
-		end
-		avgMs = sum / #state.samples
-	end
-
-	local verdict = "Awaiting probe execution..."
-	if #state.samples > 0 then
-		local last = state.samples[#state.samples]
-		verdict = string.format("Last: %.1f ms | Avg: %.1f ms -> %s", last.ms, avgMs, classifyLatency(avgMs))
-	end
-
+	local snapText, traitOnly = getTraitGuiSnapshot()
 	pcall(function()
-		ui.statusLabel.Text = string.format(
-			"Hook: %s | Armed: %s | Live Trait: %s",
-			state.hookActive and "ACTIVE" or "FALLBACK",
-			state.armed and "YES (Listening)" or "NO",
-			getLiveTraitText()
-		)
-		ui.verdictBox.Text = table.concat({
-			"=== TEST #1: COMMIT LATENCY & SERVER WRITE PROBE ===",
-			"Hypothesis: Does reroll wait for DataStore write or return from RAM?",
-			"Samples: " .. tostring(#state.samples) .. "   |   " .. verdict,
+		ui.statusLabel.Text = string.format("Armed: %s | Rerolls: %d | Live Trait: %s", state.armed and "YES" or "NO", state.rerollCount, tostring(traitOnly))
+		ui.summaryBox.Text = table.concat({
+			"=== TEST #2: DELAYED UI & TOKEN STATE CORRELATION ===",
+			"Hypothesis: Does reroll update tokens/state even when CurrentTraitText looks unchanged?",
+			"Snapshot: " .. snapText,
 		}, "\n")
-
-		ui.armBtn.Text = state.armed and "1. Probe: ARMED (Click to Disarm)" or "1. Arm Reroll Probe"
+		ui.armBtn.Text = state.armed and "1. Probe: ARMED (Click to Disarm)" or "1. Arm State Watcher"
 		ui.armBtn.BackgroundColor3 = state.armed and C.good or C.accent
 
 		local view = {}
 		for i = math.max(1, #state.logs - 16), #state.logs do
 			view[#view + 1] = state.logs[i]
 		end
-		ui.logBox.Text = (#view > 0) and table.concat(view, "\n") or "Ready. Run Baseline Ping first, then Arm Probe and do 1 reroll."
+		ui.logBox.Text = (#view > 0) and table.concat(view, "\n") or "Ready. Arm watcher, perform 1 Trait Reroll, and wait ~2s."
 	end)
 end
 
-local function runBaselinePing()
-	local c2s = getEndpointsFolder()
-	local fn = c2s and (c2s:FindFirstChild("poll_active_items") or c2s:FindFirstChild("get_current_event"))
-	if not (fn and fn:IsA("RemoteFunction")) then
-		addLog("BASELINE_ERR", "No safe read-only RemoteFunction found for baseline RTT.")
-		refreshUI()
-		return
-	end
-
-	addLog("BASELINE", "Measuring baseline network RTT via " .. fn.Name .. "...")
+local function monitorRerollWindow(sourceName)
+	state.rerollCount += 1
+	local idx = state.rerollCount
+	local snapBefore = select(1, getTraitGuiSnapshot())
+	addLog("WINDOW_START", string.format("#%d via %s | Before: [%s]", idx, sourceName, snapBefore))
 	refreshUI()
 
 	task.spawn(function()
-		local t0 = os.clock()
-		local ok = pcall(function()
-			fn:InvokeServer()
-		end)
-		local dt = (os.clock() - t0) * 1000
-		if ok then
-			addLog("BASELINE_OK", string.format("Network RTT (%s) = %.1f ms (Pure Server Round-Trip)", fn.Name, dt))
-		else
-			addLog("BASELINE_WARN", string.format("Call returned error after %.1f ms", dt))
+		local tStart = os.clock()
+		local lastSnap = snapBefore
+		for step = 1, 6 do
+			task.wait(0.5)
+			if destroyed then
+				return
+			end
+			local curSnap = select(1, getTraitGuiSnapshot())
+			if curSnap ~= lastSnap then
+				local dtMs = (os.clock() - tStart) * 1000
+				addLog("STATE_SHIFT", string.format("#%d at +%.0fms: [%s] -> [%s]", idx, dtMs, lastSnap, curSnap))
+				lastSnap = curSnap
+				refreshUI()
+			end
 		end
-		refreshUI()
+		if lastSnap == snapBefore then
+			addLog("NO_UI_DIFF", string.format("#%d after 3.0s: GUI labels showed no text change [%s]", idx, snapBefore))
+			refreshUI()
+		end
 	end)
 end
 
-local function recordProbeSample(remoteName, ms, beforeTrait, afterTrait)
-	state.samples[#state.samples + 1] = {
-		name = remoteName,
-		ms = ms,
-		before = beforeTrait,
-		after = afterTrait,
-	}
-	addLog("PROBE_DATA", string.format("%s took %.1f ms | Trait: %q -> %q | %s", remoteName, ms, beforeTrait, afterTrait, classifyLatency(ms)))
-	refreshUI()
-end
-
-local function installHooks()
+local function installWatchers()
 	local hookmetamethodFn = findExecutorFn("hookmetamethod")
 	local getnamecallmethodFn = findExecutorFn("getnamecallmethod")
 	local checkcallerFn = findExecutorFn("checkcaller")
@@ -201,47 +169,40 @@ local function installHooks()
 					local isInternal = type(checkcallerFn) == "function" and checkcallerFn()
 					local rName = self.Name
 					if not isInternal and (rName == "request_token_trait_reroll" or rName == "reroll_base_stats_all" or rName == "reroll_base_stats_specific") then
-						local beforeTrait = getLiveTraitText()
-						local t0 = os.clock()
-						local results = table.pack(oldNamecall(self, ...))
-						local dt = (os.clock() - t0) * 1000
 						task.defer(function()
-							task.wait(0.15)
-							recordProbeSample(rName, dt, beforeTrait, getLiveTraitText())
+							monitorRerollWindow(rName)
 						end)
-						return table.unpack(results, 1, results.n)
 					end
 				end
 				return oldNamecall(self, ...)
 			end)
 		end)
 		if ok and oldNamecall then
-			state.hookActive = true
-			addLog("HOOK", "Installed __namecall timing probe for reroll endpoints.")
-			return
+			addLog("HOOK", "Watching InvokeServer on reroll endpoints over a 3.0s window.")
 		end
 	end
 
-	-- Fallback UI watcher if __namecall hook is unavailable
-	local lp = Players and Players.LocalPlayer
-	local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
-	local tr = pg and pg:FindFirstChild("TraitReroll")
-	local cur = tr and tr:FindFirstChild("CurrentTraitText", true)
-	if cur and cur:IsA("TextLabel") then
-		local lastVal = cur.Text
-		trackConn(cur:GetPropertyChangedSignal("Text"):Connect(function()
-			if destroyed or not state.armed then
-				lastVal = cur.Text
-				return
+	if ReplicatedStorage then
+		local ep = ReplicatedStorage:FindFirstChild("endpoints")
+		local s2c = ep and ep:FindFirstChild("server_to_client")
+		if s2c then
+			for _, evName in ipairs({ "token_trait_reroll_amount_changed", "token_curse_reroll_amount_changed", "unit_unique_data_changed" }) do
+				local ev = s2c:FindFirstChild(evName)
+				if ev and ev:IsA("RemoteEvent") then
+					trackConn(ev.OnClientEvent:Connect(function(...)
+						if not destroyed and state.armed then
+							local args = table.pack(...)
+							local preview = {}
+							for i = 1, math.min(args.n, 3) do
+								preview[#preview + 1] = tostring(args[i])
+							end
+							addLog("S2C_EVENT", evName .. " fired | args=" .. table.concat(preview, ", "))
+							refreshUI()
+						end
+					end))
+				end
 			end
-			local newVal = cur.Text
-			if newVal ~= lastVal then
-				addLog("UI_CHANGE", string.format("CurrentTraitText changed: %q -> %q (Fallback mode: no exact RPC RTT)", lastVal, newVal))
-				lastVal = newVal
-				refreshUI()
-			end
-		end))
-		addLog("FALLBACK", "hookmetamethod unavailable; watching CurrentTraitText changes.")
+		end
 	end
 end
 
@@ -270,7 +231,7 @@ local function buildUI()
 	ui.screenGui.Name = TEST_TAG
 	ui.screenGui.ResetOnSpawn = false
 	ui.screenGui.IgnoreGuiInset = true
-	ui.screenGui.DisplayOrder = 130
+	ui.screenGui.DisplayOrder = 135
 
 	ui.main = Instance.new("Frame")
 	ui.main.Name = "Main"
@@ -296,7 +257,7 @@ local function buildUI()
 	title.Font = Enum.Font.GothamBold
 	title.TextSize = 14
 	title.TextXAlignment = Enum.TextXAlignment.Left
-	title.Text = "TEST #1: HYPOTHESIS & COMMIT LATENCY PROBE"
+	title.Text = "TEST #2: DELAYED UI & STATE CORRELATION"
 	title.Parent = ui.dragBar
 
 	ui.closeBtn = Instance.new("TextButton")
@@ -321,20 +282,20 @@ local function buildUI()
 	ui.statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 	ui.statusLabel.Parent = ui.main
 
-	ui.verdictBox = Instance.new("TextLabel")
-	ui.verdictBox.Size = UDim2.new(1, -24, 0, 64)
-	ui.verdictBox.Position = UDim2.new(0, 12, 0, 62)
-	ui.verdictBox.BackgroundColor3 = C.card
-	ui.verdictBox.BorderSizePixel = 0
-	ui.verdictBox.TextColor3 = C.text
-	ui.verdictBox.Font = Enum.Font.Code
-	ui.verdictBox.TextSize = 12
-	ui.verdictBox.TextXAlignment = Enum.TextXAlignment.Left
-	ui.verdictBox.TextYAlignment = Enum.TextYAlignment.Top
-	ui.verdictBox.TextWrapped = true
-	ui.verdictBox.Parent = ui.main
-	Instance.new("UICorner", ui.verdictBox).CornerRadius = UDim.new(0, 6)
-	local p1 = Instance.new("UIPadding", ui.verdictBox)
+	ui.summaryBox = Instance.new("TextLabel")
+	ui.summaryBox.Size = UDim2.new(1, -24, 0, 64)
+	ui.summaryBox.Position = UDim2.new(0, 12, 0, 62)
+	ui.summaryBox.BackgroundColor3 = C.card
+	ui.summaryBox.BorderSizePixel = 0
+	ui.summaryBox.TextColor3 = C.text
+	ui.summaryBox.Font = Enum.Font.Code
+	ui.summaryBox.TextSize = 12
+	ui.summaryBox.TextXAlignment = Enum.TextXAlignment.Left
+	ui.summaryBox.TextYAlignment = Enum.TextYAlignment.Top
+	ui.summaryBox.TextWrapped = true
+	ui.summaryBox.Parent = ui.main
+	Instance.new("UICorner", ui.summaryBox).CornerRadius = UDim.new(0, 6)
+	local p1 = Instance.new("UIPadding", ui.summaryBox)
 	p1.PaddingLeft = UDim.new(0, 8)
 	p1.PaddingTop = UDim.new(0, 6)
 
@@ -353,9 +314,9 @@ local function buildUI()
 		return b
 	end
 
-	ui.armBtn = makeBtn("1. Arm Reroll Probe", 12, 134, 180, C.accent)
-	ui.pingBtn = makeBtn("2. Measure Baseline Ping", 198, 134, 150, C.btn)
-	ui.copyBtn = makeBtn("Copy Test Log", 354, 134, 134, C.btn)
+	ui.armBtn = makeBtn("1. Arm State Watcher", 12, 134, 180, C.accent)
+	ui.snapBtn = makeBtn("2. Read GUI Now", 198, 134, 140, C.btn)
+	ui.copyBtn = makeBtn("Copy Test #2 Log", 344, 134, 144, C.btn)
 
 	ui.logBox = Instance.new("TextBox")
 	ui.logBox.Size = UDim2.new(1, -24, 0, 210)
@@ -381,20 +342,24 @@ local function bindEvents()
 	trackConn(ui.closeBtn.Activated:Connect(cleanupTest))
 	trackConn(ui.armBtn.Activated:Connect(function()
 		state.armed = not state.armed
-		addLog("STATE", state.armed and "Probe ARMED: perform 1 Trait Reroll now." or "Probe DISARMED.")
+		addLog("STATE", state.armed and "Watcher ARMED: perform 1 Trait Reroll and wait 3s." or "Watcher DISARMED.")
 		refreshUI()
 	end))
-	trackConn(ui.pingBtn.Activated:Connect(runBaselinePing))
+	trackConn(ui.snapBtn.Activated:Connect(function()
+		local snap = select(1, getTraitGuiSnapshot())
+		addLog("READ_NOW", snap)
+		refreshUI()
+	end))
 	trackConn(ui.copyBtn.Activated:Connect(function()
 		local header = {
-			"=== TEST #1 REPORT: COMMIT LATENCY PROBE ===",
+			"=== TEST #2 REPORT: DELAYED UI & STATE CORRELATION ===",
 			ui.statusLabel.Text,
-			ui.verdictBox.Text,
+			ui.summaryBox.Text,
 			"--- LOGS ---",
 		}
 		local full = table.concat(header, "\n") .. "\n" .. table.concat(state.logs, "\n")
 		local ok = setClipboardSafe(full)
-		addLog("EXPORT", ok and "Copied Test #1 report to clipboard." or "Clipboard unavailable.")
+		addLog("EXPORT", ok and "Copied Test #2 log." or "Clipboard unavailable.")
 		refreshUI()
 	end))
 
@@ -450,6 +415,6 @@ task.defer(function()
 	buildUI()
 	bindEvents()
 	ui.screenGui.Parent = parent
-	installHooks()
+	installWatchers()
 	refreshUI()
 end)
