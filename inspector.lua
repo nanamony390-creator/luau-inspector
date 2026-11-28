@@ -50,7 +50,8 @@ local scanToken = 0
 local destroyed = false
 local safeCallsHooked = 0
 local hookedRemotes = {}
-local hookedRemotePaths = {}
+local remoteInventory = {}
+local remoteInventorySeen = {}
 local ui = {}
 
 local C = {
@@ -716,16 +717,35 @@ local function captureTargetSnapshot()
 	renderRightBox()
 end
 
+local function recordRemoteInventory(statusTag, cls, rPath)
+	local key = tostring(statusTag) .. "|" .. tostring(cls) .. "|" .. tostring(rPath)
+	if remoteInventorySeen[key] then
+		return
+	end
+	remoteInventorySeen[key] = true
+	remoteInventory[#remoteInventory + 1] = string.format("[%s | %s] %s", tostring(statusTag), tostring(cls), tostring(rPath))
+end
+
 local function hookSingleRemoteSafe(remote)
-	if destroyed or typeof(remote) ~= "Instance" or hookedRemotes[remote] or isOwnGui(remote) then
+	if destroyed or typeof(remote) ~= "Instance" or isOwnGui(remote) then
 		return
 	end
 	local cls = propSafe(remote, "ClassName")
 	local rPath = fullPathSafe(remote)
+	local isEndpoint = string.find(string.lower(rPath), "endpoints", 1, true) ~= nil
+
+	if hookedRemotes[remote] then
+		if isEndpoint then
+			recordRemoteInventory("HOOKED", cls, rPath)
+		end
+		return
+	end
+
 	if cls == "RemoteFunction" then
 		local okGet, origFn = pcall(function()
 			return remote.InvokeServer
 		end)
+		local hooked = false
 		if okGet and type(origFn) == "function" then
 			local okSet = pcall(function()
 				remote.InvokeServer = function(self, ...)
@@ -745,14 +765,18 @@ local function hookSingleRemoteSafe(remote)
 			end)
 			if okSet then
 				hookedRemotes[remote] = { fnProp = "InvokeServer", orig = origFn }
-				hookedRemotePaths[#hookedRemotePaths + 1] = string.format("[RemoteFunction] %s", rPath)
 				safeCallsHooked += 1
+				hooked = true
 			end
+		end
+		if isEndpoint then
+			recordRemoteInventory(hooked and "HOOKED" or "UNHOOKED", cls, rPath)
 		end
 	elseif cls == "RemoteEvent" then
 		local okGet, origFn = pcall(function()
 			return remote.FireServer
 		end)
+		local hooked = false
 		if okGet and type(origFn) == "function" then
 			local okSet = pcall(function()
 				remote.FireServer = function(self, ...)
@@ -772,10 +796,15 @@ local function hookSingleRemoteSafe(remote)
 			end)
 			if okSet then
 				hookedRemotes[remote] = { fnProp = "FireServer", orig = origFn }
-				hookedRemotePaths[#hookedRemotePaths + 1] = string.format("[RemoteEvent] %s", rPath)
 				safeCallsHooked += 1
+				hooked = true
 			end
 		end
+		if isEndpoint then
+			recordRemoteInventory(hooked and "HOOKED" or "UNHOOKED", cls, rPath)
+		end
+	elseif isEndpoint then
+		recordRemoteInventory("DETECTED", cls, rPath)
 	end
 end
 
@@ -788,7 +817,8 @@ local function unhookAllRemotesSafe()
 		end
 	end
 	hookedRemotes = {}
-	hookedRemotePaths = {}
+	remoteInventory = {}
+	remoteInventorySeen = {}
 	safeCallsHooked = 0
 end
 
@@ -802,7 +832,8 @@ local function attachAllRemotesSafe()
 	if okD and type(desc) == "table" then
 		for _, inst in ipairs(desc) do
 			local cls = propSafe(inst, "ClassName")
-			if cls == "RemoteFunction" or cls == "RemoteEvent" then
+			local pathL = string.lower(fullPathSafe(inst))
+			if cls == "RemoteFunction" or cls == "RemoteEvent" or string.find(pathL, "endpoints", 1, true) then
 				hookSingleRemoteSafe(inst)
 			end
 		end
@@ -983,7 +1014,12 @@ local function insertEntry(inst)
 	entryCount += 1
 
 	local pathL = string.lower(info.fullName)
-	if isValueKind(info.className) or info.weight > 0 or isRerollGuiPath(pathL) then
+	local isTrackedState = isValueKind(info.className)
+		or info.weight > 0
+		or isRerollGuiPath(pathL)
+		or string.find(pathL, "__hidden_pets", 1, true) ~= nil
+
+	if isTrackedState then
 		local okAttr, attrSig = pcall(function()
 			return inst.AttributeChanged
 		end)
@@ -1135,11 +1171,11 @@ local function buildFullReport()
 		"--- [0A] HOOKED REMOTES INVENTORY ---",
 	}
 
-	if #hookedRemotePaths == 0 then
+	if #remoteInventory == 0 then
 		out[#out + 1] = "(None)"
 	else
-		for i = 1, math.min(#hookedRemotePaths, 120) do
-			out[#out + 1] = "• " .. hookedRemotePaths[i]
+		for i = 1, math.min(#remoteInventory, 120) do
+			out[#out + 1] = "• " .. remoteInventory[i]
 		end
 	end
 
@@ -1798,7 +1834,7 @@ local function bindInspectorEvents()
 			if isNoisePath(pathL) then
 				return
 			end
-			if cls == "RemoteFunction" or cls == "RemoteEvent" then
+			if cls == "RemoteFunction" or cls == "RemoteEvent" or string.find(pathL, "endpoints", 1, true) then
 				hookSingleRemoteSafe(inst)
 			end
 			if isRemoteKind(cls) or isValueKind(cls) or isActionableRerollControl(inst, pathL) then
