@@ -42,6 +42,8 @@ local markCounter = 0
 local markStartClock = os.clock()
 local lastEventClock = nil
 local snapshotText = ""
+local prevSnapshotMap = nil
+local lastDiffSummary = ""
 
 local activeFilter = "All"
 local searchQuery = ""
@@ -86,9 +88,12 @@ local NOISE_PATH_PATTERNS = {
 	"_overhead",
 	"_fx_cache",
 	"collection.grid.list.outer.unitframes",
+	"lobby_assets",
+	"packages.",
+	"surfacegui",
 }
 
-local NOISE_EXACT_OR_SUFFIX = {
+local NOISE_EXACT_NAMES = {
 	"rainbow",
 	"scaledampeningpercent",
 	"avatarpartscaletype",
@@ -96,6 +101,14 @@ local NOISE_EXACT_OR_SUFFIX = {
 	"_parent_folder",
 	"_player",
 	"spinning",
+	"border",
+	"bordershadow",
+	"pattern",
+	"line",
+	"backgroundglow",
+	"bannerdecoht",
+	"bannerdecoglow",
+	"titleimage",
 }
 
 local VALUE_PROPS = {
@@ -226,6 +239,23 @@ local function isOwnGui(inst)
 	return ok and res or false
 end
 
+local function isLocalPlayerOwnedPet(inst)
+	local lp = Players and Players.LocalPlayer
+	if not lp then
+		return true
+	end
+	local playerVal = safeCall(function()
+		return inst:FindFirstChild("_player")
+	end)
+	if playerVal and isClass(playerVal, "ObjectValue") then
+		local owner = propSafe(playerVal, "Value")
+		if owner and owner ~= lp then
+			return false
+		end
+	end
+	return true
+end
+
 local function isNoisePath(pathLower)
 	if not pathLower or pathLower == "" then
 		return false
@@ -253,7 +283,7 @@ local function isLiveNoise(inst, pathLower)
 		return true
 	end
 	local nameL = string.lower(tostring(propSafe(inst, "Name") or ""))
-	for _, n in ipairs(NOISE_EXACT_OR_SUFFIX) do
+	for _, n in ipairs(NOISE_EXACT_NAMES) do
 		if nameL == n then
 			return true
 		end
@@ -270,8 +300,47 @@ local function isRerollGuiPath(pathLower)
 		or string.find(pathLower, "reroll", 1, true) ~= nil
 end
 
+local function isRelevantRerollSnapshotNode(inst, pathLower)
+	if not isRerollGuiPath(pathLower) then
+		return false
+	end
+	local nameL = string.lower(tostring(propSafe(inst, "Name") or ""))
+	for _, n in ipairs(NOISE_EXACT_NAMES) do
+		if nameL == n then
+			return false
+		end
+	end
+	local cls = propSafe(inst, "ClassName")
+	if cls == "TextButton" or cls == "ImageButton" or cls == "TextBox" then
+		return true
+	end
+	if cls == "TextLabel" then
+		local txt = tostring(propSafe(inst, "Text") or "")
+		if txt ~= "" and (
+			string.find(nameL, "quantity", 1, true)
+			or string.find(nameL, "stat", 1, true)
+			or string.find(nameL, "trait", 1, true)
+			or string.find(nameL, "level", 1, true)
+			or string.find(nameL, "name", 1, true)
+			or string.find(nameL, "title", 1, true)
+			or string.find(nameL, "note", 1, true)
+			or string.find(nameL, "cost", 1, true)
+		) then
+			return true
+		end
+	end
+	return string.find(nameL, "reroll", 1, true) ~= nil
+		or string.find(nameL, "quantity", 1, true) ~= nil
+		or string.find(nameL, "stat", 1, true) ~= nil
+		or string.find(nameL, "trait", 1, true) ~= nil
+		or string.find(nameL, "receiveunit", 1, true) ~= nil
+end
+
 local function isActionableRerollControl(inst, pathLower)
 	if not isRerollGuiPath(pathLower) then
+		return false
+	end
+	if isLiveNoise(inst, pathLower) then
 		return false
 	end
 	local cls = propSafe(inst, "ClassName")
@@ -643,60 +712,85 @@ local function pushLiveEvent(inst, tagText)
 	pushRawLiveLine(line, pathStr)
 end
 
-local function captureTargetSnapshot()
-	local lines = {
-		"=== STATE SNAPSHOT (Mark #" .. tostring(markCounter) .. ") ===",
-	}
-	local roots = {}
-	if ReplicatedStorage then
-		roots[#roots + 1] = ReplicatedStorage
+local function buildSnapshotDiff(currMap, prevMap)
+	if type(prevMap) ~= "table" then
+		return "First snapshot baseline (no prior snapshot to diff)."
 	end
+	local diffs = {}
+	for key, newVal in pairsSorted(currMap) do
+		local oldVal = prevMap[key]
+		if oldVal == nil then
+			if #diffs < 40 then
+				diffs[#diffs + 1] = "[ADDED] " .. key .. " = " .. newVal
+			end
+		elseif oldVal ~= newVal then
+			if #diffs < 40 then
+				diffs[#diffs + 1] = "[CHANGED] " .. key .. ": " .. oldVal .. " -> " .. newVal
+			end
+		end
+	end
+	for key, oldVal in pairsSorted(prevMap) do
+		if currMap[key] == nil and #diffs < 40 then
+			diffs[#diffs + 1] = "[REMOVED] " .. key .. " (was " .. oldVal .. ")"
+		end
+	end
+	if #diffs == 0 then
+		return "No differences vs previous snapshot (identical state)."
+	end
+	return table.concat(diffs, "\n")
+end
+
+local function captureTargetSnapshot()
+	local currMap = {}
+	local rerollLines = {}
+	local petLines = {}
+
 	local lp = Players and Players.LocalPlayer
 	if lp then
 		local pg = safeCall(function()
 			return lp:FindFirstChildOfClass("PlayerGui")
 		end)
 		if pg then
-			roots[#roots + 1] = pg
-		end
-	end
-
-	local rerollGui = {}
-	local hiddenPets = {}
-	local otherTarget = {}
-
-	for _, root in ipairs(roots) do
-		local okD, desc = pcall(function()
-			return root:GetDescendants()
-		end)
-		if okD and type(desc) == "table" then
-			for _, inst in ipairs(desc) do
-				if typeof(inst) == "Instance" and not isOwnGui(inst) then
-					local cls = propSafe(inst, "ClassName")
-					local pathStr = fullPathSafe(inst)
-					local pathL = string.lower(pathStr)
-					if not SKIP_CLASSES[cls] and not isNoisePath(pathL) then
-						local w = targetWeight(inst)
-						local attrs = attrsSafe(inst)
-						local val = isValueKind(cls) and propSafe(inst, "Value") or nil
-						local txt = isClass(inst, "TextLabel") and propSafe(inst, "Text") or nil
-						local vis = propSafe(inst, "Visible")
-						if next(attrs) ~= nil or val ~= nil or txt ~= nil or vis ~= nil then
-							local item = {
-								name = tostring(propSafe(inst, "Name") or "?"),
-								cls = tostring(cls),
-								path = pathStr,
-								val = val,
-								txt = txt,
-								vis = vis,
-								attrs = attrs,
-							}
-							if string.find(pathL, "playergui", 1, true) and isRerollGuiPath(pathL) then
-								rerollGui[#rerollGui + 1] = item
-							elseif string.find(pathL, "__hidden_pets", 1, true) then
-								hiddenPets[#hiddenPets + 1] = item
-							elseif isValueKind(cls) or w >= 6 then
-								otherTarget[#otherTarget + 1] = item
+			for _, guiName in ipairs({ "StatReroll", "TraitReroll" }) do
+				local guiRoot = pg:FindFirstChild(guiName)
+				if guiRoot then
+					local okD, desc = pcall(function()
+						return guiRoot:GetDescendants()
+					end)
+					if okD and type(desc) == "table" then
+						for _, inst in ipairs(desc) do
+							if typeof(inst) == "Instance" and not isOwnGui(inst) then
+								local pathStr = fullPathSafe(inst)
+								local pathL = string.lower(pathStr)
+								if isRelevantRerollSnapshotNode(inst, pathL) then
+									local cls = tostring(propSafe(inst, "ClassName") or "?")
+									local txt = isClass(inst, "TextLabel") and propSafe(inst, "Text") or nil
+									local vis = propSafe(inst, "Visible")
+									local attrs = attrsSafe(inst)
+									local parts = {}
+									if txt ~= nil and tostring(txt) ~= "" then
+										parts[#parts + 1] = "Text=" .. fmtVal(txt)
+										currMap[pathStr .. ".Text"] = fmtVal(txt)
+									end
+									if vis ~= nil then
+										parts[#parts + 1] = "Visible=" .. tostring(vis)
+										currMap[pathStr .. ".Visible"] = tostring(vis)
+									end
+									for k, v in pairsSorted(attrs) do
+										local fv = fmtVal(v)
+										parts[#parts + 1] = "attr:" .. tostring(k) .. "=" .. fv
+										currMap[pathStr .. "@attr:" .. tostring(k)] = fv
+									end
+									if #parts > 0 and #rerollLines < 45 then
+										rerollLines[#rerollLines + 1] = string.format(
+											"• %s [%s] -> %s | %s",
+											tostring(propSafe(inst, "Name") or "?"),
+											cls,
+											pathStr,
+											table.concat(parts, ", ")
+										)
+									end
+								end
 							end
 						end
 					end
@@ -705,36 +799,69 @@ local function captureTargetSnapshot()
 		end
 	end
 
-	local count = 0
-	local function appendGroup(list, maxTake)
-		local taken = 0
-		for _, item in ipairs(list) do
-			if count >= 100 or taken >= maxTake then
-				break
-			end
-			count += 1
-			taken += 1
-			lines[#lines + 1] = string.format("• %s [%s] -> %s", item.name, item.cls, item.path)
-			if item.val ~= nil then
-				lines[#lines + 1] = "    Value = " .. fmtVal(item.val)
-			end
-			if item.txt ~= nil and tostring(item.txt) ~= "" then
-				lines[#lines + 1] = "    Text = " .. fmtVal(item.txt)
-			end
-			if item.vis ~= nil then
-				lines[#lines + 1] = "    Visible = " .. tostring(item.vis)
-			end
-			for k, v in pairsSorted(item.attrs) do
-				lines[#lines + 1] = "    attr " .. k .. " = " .. fmtVal(v)
+	local hp = ReplicatedStorage and ReplicatedStorage:FindFirstChild("__HIDDEN_PETS")
+	if hp then
+		local okC, children = pcall(function()
+			return hp:GetChildren()
+		end)
+		if okC and type(children) == "table" then
+			for _, petModel in ipairs(children) do
+				if typeof(petModel) == "Instance" and isClass(petModel, "Model") and isLocalPlayerOwnedPet(petModel) then
+					local pPath = fullPathSafe(petModel)
+					local attrs = attrsSafe(petModel)
+					local unitId = attrs._unit_id and fmtVal(attrs._unit_id) or "?"
+					local kv = {}
+					for k, v in pairsSorted(attrs) do
+						local fv = fmtVal(v)
+						currMap[pPath .. "@attr:" .. tostring(k)] = fv
+						if tostring(k) ~= "_unit_id" then
+							kv[#kv + 1] = tostring(k) .. "=" .. fv
+						end
+					end
+					if #petLines < 35 then
+						petLines[#petLines + 1] = string.format(
+							"• %s (%s) -> %s",
+							tostring(propSafe(petModel, "Name") or "?"),
+							unitId,
+							pPath
+						)
+						if #kv > 0 then
+							petLines[#petLines + 1] = "    " .. table.concat(kv, " | ")
+						end
+					end
+				end
 			end
 		end
 	end
 
-	appendGroup(rerollGui, 40)
-	appendGroup(hiddenPets, 30)
-	appendGroup(otherTarget, 30)
+	lastDiffSummary = buildSnapshotDiff(currMap, prevSnapshotMap)
+	prevSnapshotMap = currMap
 
-	lines[#lines + 1] = "Snapshot Items: " .. tostring(count) .. " (RerollGUI:" .. tostring(#rerollGui) .. " | Pets:" .. tostring(#hiddenPets) .. " | Other:" .. tostring(#otherTarget) .. ")"
+	local lines = {
+		"=== STATE SNAPSHOT (Mark #" .. tostring(markCounter) .. ") ===",
+		"--- DIFF VS PREVIOUS SNAPSHOT ---",
+		lastDiffSummary,
+		"",
+		"--- REROLL UI (" .. tostring(#rerollLines) .. ") ---",
+	}
+	if #rerollLines == 0 then
+		lines[#lines + 1] = "(No relevant StatReroll/TraitReroll elements)"
+	else
+		for _, l in ipairs(rerollLines) do
+			lines[#lines + 1] = l
+		end
+	end
+
+	lines[#lines + 1] = ""
+	lines[#lines + 1] = "--- LOCAL HIDDEN PETS (" .. tostring(#petLines) .. ") ---"
+	if #petLines == 0 then
+		lines[#lines + 1] = "(None)"
+	else
+		for _, l in ipairs(petLines) do
+			lines[#lines + 1] = l
+		end
+	end
+
 	snapshotText = table.concat(lines, "\n")
 	rightViewMode = "Snapshot"
 	if ui.viewModeBtn then
@@ -1157,6 +1284,8 @@ local function clearLogsData()
 	touchedPaths = {}
 	touchedOrder = {}
 	snapshotText = ""
+	prevSnapshotMap = nil
+	lastDiffSummary = ""
 	markCounter = 0
 	markStartClock = os.clock()
 	lastEventClock = nil
@@ -1273,7 +1402,7 @@ local function buildFullReport()
 		if a.weight ~= b.weight then
 			return a.weight > b.weight
 		end
-		return tostring(a.fullName) < tostring(a.fullName)
+		return tostring(a.fullName) < tostring(b.fullName)
 	end)
 
 	local limit = math.min(#found, MAX_TARGET_HITS)
