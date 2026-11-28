@@ -12,10 +12,11 @@ local CoreGui = getServiceSafe("CoreGui")
 local UserInputService = getServiceSafe("UserInputService")
 local HttpService = getServiceSafe("HttpService")
 
-local APP_TAG = "RollbackLab_v4_0_AutoLoad"
+local APP_TAG = "RollbackLab_v4_3_DiagLog"
 local GUARD_KEY = "__LiveTrialGuard_" .. APP_TAG
-local STATE_FILE = "RollbackLab_v4_0_State.json"
-local SCRIPT_SOURCE_FILE = "RollbackLab_v4_0_Runner.lua"
+local STATE_FILE = "RollbackLab_v4_3_State.json"
+local LOG_FILE = "RollbackLab_v4_3_Logs.txt"
+local RUNNER_FILE = "RollbackLab_v4_1_Runner.lua"
 
 local connections = {}
 local destroyed = false
@@ -37,14 +38,17 @@ local C = {
 local state = {
 	rollbackActive = false,
 	autoLoadOnTp = true,
-	exitMethod = "TELEPORT", -- TELEPORT | KICK_TP | SHUTDOWN
+	loadDelaySec = 3,
+	exitMethod = "TELEPORT",
 	unitGuid = "Unknown",
 	unitName = "Unknown",
 	liveTrait = "N/A",
-	liveTokens = "Unknown",
-	savedBase = nil,
+	tok1x = "Unknown",
+	tok5x = "Unknown",
+	armedBase = nil,
 	pendingConfirm = false,
-	verdict = "v4.0 Ready: Toggle [1. Activate Rollback] before rolling, then [2. Confirm Rollback].",
+	conflictCount = 0,
+	verdict = "v4.3 Ready: Persistent disk logging + Rollback Active health checks.",
 	logs = {},
 }
 
@@ -73,37 +77,83 @@ local function setClipboardSafe(text)
 	return type(fn) == "function" and pcall(fn, text) or false
 end
 
-local function writeJsonSafe(filename, tbl)
+local function writeTextSafe(filename, content)
 	local writeFn = findExecutorFn("writefile")
-	if type(writeFn) == "function" and HttpService then
-		local okEnc, json = pcall(function()
-			return HttpService:JSONEncode(tbl)
-		end)
-		if okEnc and json then
-			return pcall(writeFn, filename, json)
-		end
+	if type(writeFn) == "function" and type(content) == "string" then
+		return pcall(writeFn, filename, content)
 	end
 	return false
 end
 
-local function readJsonSafe(filename)
+local function appendTextSafe(filename, line)
+	local appendFn = findExecutorFn("appendfile")
+	if type(appendFn) == "function" then
+		local ok = pcall(appendFn, filename, line .. "\n")
+		if ok then
+			return true
+		end
+	end
 	local readFn = findExecutorFn("readfile")
 	local isFileFn = findExecutorFn("isfile")
-	if type(readFn) == "function" and HttpService then
+	local prev = ""
+	if type(readFn) == "function" then
+		local exists = true
+		if type(isFileFn) == "function" then
+			local okEx, ex = pcall(isFileFn, filename)
+			exists = okEx and ex
+		end
+		if exists then
+			local okR, raw = pcall(readFn, filename)
+			if okR and type(raw) == "string" then
+				prev = raw
+			end
+		end
+	end
+	return writeTextSafe(filename, prev .. line .. "\n")
+end
+
+local function readTextSafe(filename)
+	local readFn = findExecutorFn("readfile")
+	local isFileFn = findExecutorFn("isfile")
+	if type(readFn) == "function" then
 		if type(isFileFn) == "function" then
 			local okEx, ex = pcall(isFileFn, filename)
 			if not (okEx and ex) then
 				return nil
 			end
 		end
-		local okRead, raw = pcall(readFn, filename)
-		if okRead and type(raw) == "string" and raw ~= "" then
-			local okDec, tbl = pcall(function()
-				return HttpService:JSONDecode(raw)
-			end)
-			if okDec and type(tbl) == "table" then
-				return tbl
-			end
+		local okR, raw = pcall(readFn, filename)
+		if okR and type(raw) == "string" and raw ~= "" then
+			return raw
+		end
+	end
+	return nil
+end
+
+local function writeJsonSafe(filename, tbl)
+	if not HttpService then
+		return false
+	end
+	local okEnc, json = pcall(function()
+		return HttpService:JSONEncode(tbl)
+	end)
+	if okEnc and type(json) == "string" then
+		return writeTextSafe(filename, json)
+	end
+	return false
+end
+
+local function readJsonSafe(filename)
+	if not HttpService then
+		return nil
+	end
+	local raw = readTextSafe(filename)
+	if raw then
+		local okDec, tbl = pcall(function()
+			return HttpService:JSONDecode(raw)
+		end)
+		if okDec and type(tbl) == "table" then
+			return tbl
 		end
 	end
 	return nil
@@ -112,71 +162,82 @@ end
 local function addLog(tag, msg)
 	local line = string.format("[%s | %.2fs] %s", tag, os.clock() % 1000, tostring(msg))
 	state.logs[#state.logs + 1] = line
-	if #state.logs > 140 then
+	if #state.logs > 200 then
 		table.remove(state.logs, 1)
 	end
+	pcall(appendTextSafe, LOG_FILE, line)
 end
 
 local function persistStateNow()
 	writeJsonSafe(STATE_FILE, {
 		rollbackActive = state.rollbackActive,
 		autoLoadOnTp = state.autoLoadOnTp,
+		loadDelaySec = state.loadDelaySec,
 		exitMethod = state.exitMethod,
 		unitGuid = state.unitGuid,
 		unitName = state.unitName,
-		savedBase = state.savedBase,
+		armedBase = state.armedBase,
 		pendingConfirm = state.pendingConfirm,
+		conflictCount = state.conflictCount,
 		verdict = state.verdict,
 	})
 end
 
+local function ensureRunnerFileSaved()
+	local existing = readTextSafe(RUNNER_FILE)
+	if existing and #existing > 200 then
+		return true
+	end
+	local src = nil
+	if type(debug) == "table" and type(debug.info) == "function" then
+		local okInfo, infoSrc = pcall(debug.info, 1, "s")
+		if okInfo and type(infoSrc) == "string" and string.sub(infoSrc, 1, 1) == "@" then
+			src = readTextSafe(string.sub(infoSrc, 2))
+		end
+	end
+	if src and #src > 200 then
+		return writeTextSafe(RUNNER_FILE, src)
+	end
+	return false
+end
+
 local function armAutoLoadQueue()
 	if not state.autoLoadOnTp then
-		return false
+		return false, "AutoLoad OFF"
 	end
+	ensureRunnerFileSaved()
 	local queueFn = findExecutorFn("queue_on_teleport") or findExecutorFn("queueonteleport")
-	local readFn = findExecutorFn("readfile")
-	local isFileFn = findExecutorFn("isfile")
 	if type(queueFn) ~= "function" then
-		return false
+		return false, "queue_on_teleport unavailable"
 	end
 
-	local runnerCode = nil
-	if type(readFn) == "function" then
-		local exists = true
-		if type(isFileFn) == "function" then
-			local okEx, ex = pcall(isFileFn, SCRIPT_SOURCE_FILE)
-			exists = okEx and ex
-		end
-		if exists then
-			local okR, src = pcall(readFn, SCRIPT_SOURCE_FILE)
-			if okR and type(src) == "string" and #src > 50 then
-				runnerCode = src
-			end
-		end
-	end
-
-	if not runnerCode then
-		runnerCode = [[
+	local delayVal = tonumber(state.loadDelaySec) or 3
+	local stub = string.format([[
 if not game:IsLoaded() then game.Loaded:Wait() end
-task.wait(1.5)
+task.wait(%d)
 local rf = (type(getgenv)=="function" and getgenv().readfile) or readfile
 local ifn = (type(getgenv)=="function" and getgenv().isfile) or isfile
 if type(rf)=="function" then
-	local okEx = (type(ifn)~="function") or pcall(ifn, "RollbackLab_v4_0_Runner.lua")
-	if okEx then
-		local okC, code = pcall(rf, "RollbackLab_v4_0_Runner.lua")
-		if okC and type(code)=="string" and #code > 50 then
+	local exists = true
+	if type(ifn)=="function" then
+		local okEx, ex = pcall(ifn, %q)
+		exists = okEx and ex
+	end
+	if exists then
+		local okC, code = pcall(rf, %q)
+		if okC and type(code)=="string" and #code > 200 then
 			local fn = loadstring(code)
 			if type(fn)=="function" then pcall(fn) end
 		end
 	end
 end
-]]
-	end
+]], delayVal, RUNNER_FILE, RUNNER_FILE)
 
-	local okQ = pcall(queueFn, runnerCode)
-	return okQ
+	local okQ, errQ = pcall(queueFn, stub)
+	if okQ then
+		return true, string.format("Queued (%ds)", delayVal)
+	end
+	return false, tostring(errQ)
 end
 
 local function scanGuiState()
@@ -210,17 +271,56 @@ local function scanGuiState()
 
 		local utf = tr:FindFirstChild("UseTokenFrame", true)
 		if utf then
+			local foundPairs = {}
 			for _, d in ipairs(utf:GetDescendants()) do
-				if d:IsA("TextLabel") and string.find(d.Text, "/") then
-					local num = string.match(d.Text, "^(%d+)%s*/")
-					if num then
-						state.liveTokens = num
-						break
-					end
+				if d:IsA("TextLabel") and string.find(d.Text, "^%d+%s*/%s*%d+$") then
+					local clean = string.gsub(d.Text, "%s+", "")
+					foundPairs[#foundPairs + 1] = { text = clean, x = d.AbsolutePosition.X }
 				end
+			end
+			table.sort(foundPairs, function(a, b)
+				return a.x < b.x
+			end)
+			if foundPairs[1] then
+				state.tok1x = foundPairs[1].text
+			end
+			if foundPairs[2] then
+				state.tok5x = foundPairs[2].text
 			end
 		end
 	end
+end
+
+local function checkRollbackHealth(phaseTag)
+	pcall(scanGuiState)
+	local issues = {}
+
+	if state.rollbackActive and not state.armedBase then
+		issues[#issues + 1] = "Active without baseline"
+	end
+	if state.armedBase then
+		if state.armedBase.unitGuid ~= "Unknown" and state.unitGuid ~= "Unknown" and state.armedBase.unitGuid ~= state.unitGuid then
+			issues[#issues + 1] = "Unit GUID mismatch"
+		end
+		if state.armedBase.trait == "N/A" then
+			issues[#issues + 1] = "Baseline trait was N/A"
+		end
+	end
+	if state.liveTrait == "N/A" and state.tok1x == "Unknown" and state.tok5x == "Unknown" then
+		issues[#issues + 1] = "TraitReroll state not readable"
+	end
+
+	if #issues > 0 then
+		state.conflictCount += #issues
+		addLog("DIAG_ISSUE", string.format("[%s] %s", phaseTag, table.concat(issues, "; ")))
+		return false
+	end
+
+	addLog(
+		"DIAG_OK",
+		string.format("[%s] Active=%s | Trait=%s | 1x=%s | 5x=%s", phaseTag, tostring(state.rollbackActive), tostring(state.liveTrait), tostring(state.tok1x), tostring(state.tok5x))
+	)
+	return true
 end
 
 local function refreshUI()
@@ -230,20 +330,27 @@ local function refreshUI()
 	pcall(scanGuiState)
 	pcall(function()
 		ui.statusLabel.Text = string.format(
-			"v4.0 Engine | Rollback:%s | AutoLoad:%s | Cut:%s",
-			state.rollbackActive and "ACTIVE" or "OFF",
+			"v4.3 DiagLog | Active:%s | AutoLoad:%s (%ds) | Cut:%s | Issues:%d",
+			state.rollbackActive and "ON" or "OFF",
 			state.autoLoadOnTp and "ON" or "OFF",
-			state.exitMethod
+			state.loadDelaySec,
+			state.exitMethod,
+			state.conflictCount
 		)
 
 		local baseStr = "None"
-		if state.savedBase then
-			baseStr = string.format("%s | Tok=%s", tostring(state.savedBase.trait), tostring(state.savedBase.tokens))
+		if state.armedBase then
+			baseStr = string.format(
+				"%s | 1x:%s | 5x:%s",
+				tostring(state.armedBase.trait),
+				tostring(state.armedBase.tok1x),
+				tostring(state.armedBase.tok5x)
+			)
 		end
 
 		ui.boardBox.Text = table.concat({
 			string.format("Unit: %s | GUID: %s", tostring(state.unitName), tostring(state.unitGuid)),
-			string.format("Live: [%s | Tok=%s]   ||   Armed Base: [%s]", tostring(state.liveTrait), tostring(state.liveTokens), baseStr),
+			string.format("Now: [%s | 1x:%s | 5x:%s]  ||  Base: [%s]", tostring(state.liveTrait), tostring(state.tok1x), tostring(state.tok5x), baseStr),
 			state.verdict,
 		}, "\n")
 
@@ -252,6 +359,7 @@ local function refreshUI()
 
 		ui.autoLoadBtn.Text = state.autoLoadOnTp and "Auto-Load: ON" or "Auto-Load: OFF"
 		ui.autoLoadBtn.BackgroundColor3 = state.autoLoadOnTp and C.good or C.btn
+		ui.delayBtn.Text = string.format("LoadWait:%ds", state.loadDelaySec)
 		ui.modeBtn.Text = "Cut: " .. state.exitMethod
 
 		local view = {}
@@ -267,28 +375,32 @@ local function toggleActivateRollback()
 	if not state.rollbackActive then
 		state.rollbackActive = true
 		state.pendingConfirm = false
-		state.savedBase = {
+		state.armedBase = {
 			unitGuid = tostring(state.unitGuid),
 			unitName = tostring(state.unitName),
 			trait = tostring(state.liveTrait),
-			tokens = tostring(state.liveTokens),
+			tok1x = tostring(state.tok1x),
+			tok5x = tostring(state.tok5x),
 			armedAt = os.time(),
 		}
-		local queued = armAutoLoadQueue()
-		persistStateNow()
+		local okQ, infoQ = armAutoLoadQueue()
 		state.verdict = string.format(
-			"ROLLBACK ACTIVATED (AutoLoad:%s): Base=[%s, Tok=%s]. Roll manually, then click Confirm Rollback!",
-			queued and "QUEUED" or "READY",
-			state.savedBase.trait,
-			state.savedBase.tokens
+			"ACTIVE (%s): Base=[%s | 1x:%s | 5x:%s]. Roll manually, then Confirm.",
+			infoQ,
+			state.armedBase.trait,
+			state.armedBase.tok1x,
+			state.armedBase.tok5x
 		)
-		addLog("ACTIVATE", state.verdict)
+		addLog("ACTIVATE", state.verdict .. " | queued=" .. tostring(okQ))
+		checkRollbackHealth("AFTER_ACTIVATE")
+		persistStateNow()
 	else
 		state.rollbackActive = false
 		state.pendingConfirm = false
-		persistStateNow()
 		state.verdict = "Rollback deactivated."
 		addLog("DEACTIVATE", state.verdict)
+		checkRollbackHealth("AFTER_DEACTIVATE")
+		persistStateNow()
 	end
 	refreshUI()
 end
@@ -310,7 +422,7 @@ local function executeSessionCut()
 			end)
 			task.wait(0.02)
 			pcall(function()
-				lp:Kick("RollbackLab v4.0 Confirm Rollback")
+				lp:Kick("RollbackLab v4.3 Confirm Rollback")
 			end)
 		end
 	elseif state.exitMethod == "SHUTDOWN" then
@@ -321,55 +433,67 @@ local function executeSessionCut()
 end
 
 local function confirmRollbackNow()
-	pcall(scanGuiState)
-	if not state.savedBase then
-		state.savedBase = {
+	checkRollbackHealth("PRE_CONFIRM")
+	if not state.armedBase then
+		state.armedBase = {
 			unitGuid = tostring(state.unitGuid),
 			unitName = tostring(state.unitName),
 			trait = tostring(state.liveTrait),
-			tokens = tostring(state.liveTokens),
+			tok1x = tostring(state.tok1x),
+			tok5x = tostring(state.tok5x),
 			armedAt = os.time(),
 		}
 	end
 	state.pendingConfirm = true
-	local queued = armAutoLoadQueue()
-	persistStateNow()
-
+	local okQ, infoQ = armAutoLoadQueue()
 	addLog(
 		"CONFIRM",
 		string.format(
-			"Confirm Rollback pressed! Base=[%s, Tok=%s] -> Now=[%s, Tok=%s] | AutoLoad=%s | Cut=%s",
-			tostring(state.savedBase.trait),
-			tostring(state.savedBase.tokens),
+			"Confirm pressed | Base=[%s | 1x:%s | 5x:%s] -> Now=[%s | 1x:%s | 5x:%s] | %s | Cut=%s",
+			tostring(state.armedBase.trait),
+			tostring(state.armedBase.tok1x),
+			tostring(state.armedBase.tok5x),
 			tostring(state.liveTrait),
-			tostring(state.liveTokens),
-			tostring(queued),
+			tostring(state.tok1x),
+			tostring(state.tok5x),
+			infoQ,
 			state.exitMethod
 		)
 	)
+	persistStateNow()
 	refreshUI()
 	executeSessionCut()
 end
 
 local function evaluatePostSession()
 	pcall(scanGuiState)
-	if not state.savedBase then
+	if not state.armedBase then
 		return
 	end
-	local preTrait = tostring(state.savedBase.trait)
+	local preTrait = tostring(state.armedBase.trait)
 	local nowTrait = tostring(state.liveTrait)
-	local preTok = tostring(state.savedBase.tokens)
-	local nowTok = tostring(state.liveTokens)
+	local pre1x = tostring(state.armedBase.tok1x)
+	local now1x = tostring(state.tok1x)
+	local pre5x = tostring(state.armedBase.tok5x)
+	local now5x = tostring(state.tok5x)
 
-	if preTrait == nowTrait and (preTok == "Unknown" or preTok == nowTok) then
-		state.verdict = string.format("ROLLBACK RESULT: RESTORED [%s | Tok=%s]", preTrait, preTok)
+	local traitSame = (preTrait == nowTrait)
+	local t1Same = (pre1x == "Unknown") or (pre1x == now1x)
+	local t5Same = (pre5x == "Unknown") or (pre5x == now5x)
+
+	if traitSame and t1Same and t5Same then
+		state.verdict = string.format("POST-RESULT: MATCHED BASE [%s | 1x:%s | 5x:%s]", preTrait, pre1x, pre5x)
 	else
-		state.verdict = string.format("ROLLBACK RESULT: SERVER COMMITTED [%s, Tok=%s] (Was [%s, Tok=%s])", nowTrait, nowTok, preTrait, preTok)
+		state.verdict = string.format(
+			"POST-RESULT: CHANGED TO [%s | 1x:%s | 5x:%s] (Base: [%s | 1x:%s | 5x:%s])",
+			nowTrait, now1x, now5x, preTrait, pre1x, pre5x
+		)
 	end
 	state.pendingConfirm = false
 	state.rollbackActive = false
+	addLog("POST_RESULT", state.verdict)
+	checkRollbackHealth("POST_RETURN")
 	persistStateNow()
-	addLog("POST_LOAD", state.verdict)
 end
 
 local function bindPassiveWatchers()
@@ -383,9 +507,12 @@ local function bindPassiveWatchers()
 					if destroyed then
 						return
 					end
-					state.liveTokens = tostring(amount)
-					addLog("S2C_TOKEN", "Tokens = " .. state.liveTokens)
-					refreshUI()
+					task.defer(function()
+						task.wait(0.03)
+						pcall(scanGuiState)
+						addLog("S2C_TOKEN", string.format("Ev=%s | 1x=%s | 5x=%s", tostring(amount), tostring(state.tok1x), tostring(state.tok5x)))
+						refreshUI()
+					end)
 				end))
 			end
 
@@ -401,7 +528,7 @@ local function bindPassiveWatchers()
 					task.defer(function()
 						task.wait(0.05)
 						pcall(scanGuiState)
-						addLog("ROLL_EVENT", string.format("Trait=%q | Tokens=%s", state.liveTrait, state.liveTokens))
+						addLog("ROLL_EVENT", string.format("Trait=%q | 1x=%s | 5x=%s", state.liveTrait, state.tok1x, state.tok5x))
 						refreshUI()
 					end)
 				end))
@@ -460,7 +587,8 @@ local function bindSafeClick(btn, fn)
 	trackConn(btn.MouseButton1Click:Connect(function()
 		local ok, err = pcall(fn)
 		if not ok then
-			addLog("ERR", tostring(err))
+			state.conflictCount += 1
+			addLog("BTN_ERR", tostring(err))
 			refreshUI()
 		end
 	end))
@@ -471,12 +599,12 @@ local function buildUI()
 	ui.screenGui.Name = APP_TAG
 	ui.screenGui.ResetOnSpawn = false
 	ui.screenGui.IgnoreGuiInset = true
-	ui.screenGui.DisplayOrder = 200
+	ui.screenGui.DisplayOrder = 230
 
 	ui.main = Instance.new("Frame")
 	ui.main.Name = "Main"
-	ui.main.Size = UDim2.new(0, 580, 0, 445)
-	ui.main.Position = UDim2.new(0.5, -290, 0.5, -222)
+	ui.main.Size = UDim2.new(0, 595, 0, 455)
+	ui.main.Position = UDim2.new(0.5, -297, 0.5, -227)
 	ui.main.BackgroundColor3 = C.bg
 	ui.main.BorderSizePixel = 0
 	ui.main.Parent = ui.screenGui
@@ -497,7 +625,7 @@ local function buildUI()
 	title.Font = Enum.Font.GothamBold
 	title.TextSize = 14
 	title.TextXAlignment = Enum.TextXAlignment.Left
-	title.Text = "ROLLBACK LAB v4.0 — ROLLBACK + AUTO-LOAD ENGINE"
+	title.Text = "ROLLBACK LAB v4.3 — PERSISTENT LOG & DIAGNOSTICS"
 	title.Parent = ui.dragBar
 
 	ui.closeBtn = Instance.new("TextButton")
@@ -554,15 +682,16 @@ local function buildUI()
 		return b
 	end
 
-	ui.activateBtn = makeBtn("1. Activate Rollback", 12, 144, 156, C.accent)
-	ui.confirmBtn = makeBtn("2. Confirm Rollback", 174, 144, 156, C.danger)
-	ui.autoLoadBtn = makeBtn("Auto-Load: ON", 336, 144, 114, C.good)
-	ui.modeBtn = makeBtn("Cut: TELEPORT", 456, 144, 112, C.btn)
+	ui.activateBtn = makeBtn("1. Activate Rollback", 12, 144, 152, C.accent)
+	ui.confirmBtn = makeBtn("2. Confirm Rollback", 170, 144, 152, C.danger)
+	ui.autoLoadBtn = makeBtn("Auto-Load: ON", 328, 144, 114, C.good)
+	ui.delayBtn = makeBtn("LoadWait:3s", 448, 144, 135, C.btn)
 
-	ui.copyBtn = makeBtn("Copy v4.0 Report", 12, 180, 556, C.btn)
+	ui.modeBtn = makeBtn("Cut: TELEPORT", 12, 180, 145, C.btn)
+	ui.copyBtn = makeBtn("Copy v4.3 Log & Report", 163, 180, 420, C.btn)
 
 	ui.logBox = Instance.new("TextBox")
-	ui.logBox.Size = UDim2.new(1, -24, 0, 216)
+	ui.logBox.Size = UDim2.new(1, -24, 0, 224)
 	ui.logBox.Position = UDim2.new(0, 12, 0, 216)
 	ui.logBox.BackgroundColor3 = C.panel
 	ui.logBox.BorderSizePixel = 0
@@ -588,11 +717,25 @@ local function bindEvents()
 
 	bindSafeClick(ui.autoLoadBtn, function()
 		state.autoLoadOnTp = not state.autoLoadOnTp
-		if state.autoLoadOnTp then
-			armAutoLoadQueue()
-		end
+		local okQ, infoQ = armAutoLoadQueue()
+		addLog("AUTOLOAD", string.format("Auto-Load=%s (%s, ok=%s)", tostring(state.autoLoadOnTp), infoQ, tostring(okQ)))
 		persistStateNow()
-		addLog("AUTOLOAD", "Auto-Load on teleport/rejoin = " .. tostring(state.autoLoadOnTp))
+		refreshUI()
+	end)
+
+	local delays = { 2, 4, 6, 8 }
+	bindSafeClick(ui.delayBtn, function()
+		local idx = 1
+		for i, d in ipairs(delays) do
+			if d == state.loadDelaySec then
+				idx = (i % #delays) + 1
+				break
+			end
+		end
+		state.loadDelaySec = delays[idx]
+		local _, infoQ = armAutoLoadQueue()
+		addLog("CONFIG", string.format("Post-TP wait -> %ds (%s)", state.loadDelaySec, infoQ))
+		persistStateNow()
 		refreshUI()
 	end)
 
@@ -606,22 +749,23 @@ local function bindEvents()
 			end
 		end
 		state.exitMethod = methods[idx]
-		persistStateNow()
 		addLog("CONFIG", "Cut mode -> " .. state.exitMethod)
+		persistStateNow()
 		refreshUI()
 	end)
 
 	bindSafeClick(ui.copyBtn, function()
 		pcall(scanGuiState)
+		local diskLog = readTextSafe(LOG_FILE) or table.concat(state.logs, "\n")
 		local header = {
-			"=== ROLLBACK LAB v4.0 — AUTO-LOAD REPORT ===",
+			"=== ROLLBACK LAB v4.3 — DIAGNOSTIC LOG REPORT ===",
 			ui.statusLabel.Text,
 			ui.boardBox.Text,
-			"--- LOGS ---",
+			"--- PERSISTENT LOGS ---",
 		}
-		local full = table.concat(header, "\n") .. "\n" .. table.concat(state.logs, "\n")
+		local full = table.concat(header, "\n") .. "\n" .. diskLog
 		local ok = setClipboardSafe(full)
-		addLog("EXPORT", ok and "Copied v4.0 report to clipboard." or "Clipboard unavailable.")
+		addLog("EXPORT", ok and "Copied v4.3 log report to clipboard." or "Clipboard unavailable.")
 		refreshUI()
 	end)
 
@@ -660,19 +804,7 @@ pcall(function()
 end)
 
 task.defer(function()
-	local writeFn = findExecutorFn("writefile")
-	local okSrc, src = pcall(function()
-		return debug and debug.info and debug.info(1, "s")
-	end)
-	if type(writeFn) == "function" and type(src) == "string" and string.sub(src, 1, 1) == "@" then
-		local readFn = findExecutorFn("readfile")
-		if type(readFn) == "function" then
-			local okR, rawSelf = pcall(readFn, string.sub(src, 2))
-			if okR and type(rawSelf) == "string" and #rawSelf > 100 then
-				pcall(writeFn, SCRIPT_SOURCE_FILE, rawSelf)
-			end
-		end
-	end
+	local savedRunner = ensureRunnerFileSaved()
 
 	local parent = nil
 	if typeof(gethui) == "function" then
@@ -697,24 +829,42 @@ task.defer(function()
 	local saved = readJsonSafe(STATE_FILE)
 	if type(saved) == "table" then
 		state.autoLoadOnTp = (saved.autoLoadOnTp ~= false)
+		if tonumber(saved.loadDelaySec) then
+			state.loadDelaySec = tonumber(saved.loadDelaySec)
+		end
 		if type(saved.exitMethod) == "string" then
 			state.exitMethod = saved.exitMethod
 		end
-		if type(saved.savedBase) == "table" then
-			state.savedBase = saved.savedBase
-			if saved.savedBase.unitGuid and saved.savedBase.unitGuid ~= "Unknown" then
-				state.unitGuid = saved.savedBase.unitGuid
+		if tonumber(saved.conflictCount) then
+			state.conflictCount = tonumber(saved.conflictCount)
+		end
+		if type(saved.armedBase) == "table" then
+			state.armedBase = saved.armedBase
+			if saved.armedBase.unitGuid and saved.armedBase.unitGuid ~= "Unknown" then
+				state.unitGuid = saved.armedBase.unitGuid
 			end
 		end
-		if saved.pendingConfirm then
-			evaluatePostSession()
+	end
+
+	local prevLogRaw = readTextSafe(LOG_FILE)
+	if prevLogRaw then
+		for line in string.gmatch(prevLogRaw, "[^\r\n]+") do
+			state.logs[#state.logs + 1] = line
+			if #state.logs > 200 then
+				table.remove(state.logs, 1)
+			end
 		end
 	end
 
-	if state.autoLoadOnTp then
-		armAutoLoadQueue()
+	local okQ, infoQ = armAutoLoadQueue()
+	addLog("BOOT", string.format("v4.3 booted | runnerSaved=%s | %s (ok=%s)", tostring(savedRunner), infoQ, tostring(okQ)))
+	checkRollbackHealth("ON_BOOT")
+
+	if type(saved) == "table" and saved.pendingConfirm then
+		evaluatePostSession()
+	else
+		persistStateNow()
 	end
 
-	addLog("BOOT", "RollbackLab v4.0 initialized with Auto-Load support.")
 	refreshUI()
 end)
