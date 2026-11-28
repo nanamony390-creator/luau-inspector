@@ -12,35 +12,38 @@ local CoreGui = getServiceSafe("CoreGui")
 local UserInputService = getServiceSafe("UserInputService")
 local HttpService = getServiceSafe("HttpService")
 
-local APP_TAG = "RollbackLab_ManualGate_v2_2"
+local APP_TAG = "RollbackLab_PreRollArm_v3_1"
 local GUARD_KEY = "__LiveTrialGuard_" .. APP_TAG
-local CHECKPOINT_FILE = "RollbackLab_v2_2_Checkpoint.json"
+local BASE_FILE = "RollbackLab_v3_1_PreRollBase.json"
 
 local connections = {}
 local destroyed = false
 local ui = {}
 
 local C = {
-	bg = Color3.fromRGB(18, 20, 26),
-	panel = Color3.fromRGB(13, 15, 20),
-	card = Color3.fromRGB(26, 30, 38),
-	text = Color3.fromRGB(232, 238, 248),
-	dim = Color3.fromRGB(148, 156, 170),
-	accent = Color3.fromRGB(52, 98, 156),
-	good = Color3.fromRGB(38, 114, 84),
-	warn = Color3.fromRGB(168, 102, 34),
-	danger = Color3.fromRGB(154, 48, 54),
-	btn = Color3.fromRGB(44, 50, 64),
+	bg = Color3.fromRGB(16, 18, 24),
+	panel = Color3.fromRGB(12, 14, 19),
+	card = Color3.fromRGB(24, 28, 36),
+	text = Color3.fromRGB(235, 240, 250),
+	dim = Color3.fromRGB(145, 154, 168),
+	accent = Color3.fromRGB(48, 96, 158),
+	good = Color3.fromRGB(36, 116, 84),
+	warn = Color3.fromRGB(176, 104, 32),
+	danger = Color3.fromRGB(162, 46, 52),
+	btn = Color3.fromRGB(42, 48, 62),
 }
 
 local state = {
-	rollbackArmed = false,
+	armed = false,
+	armSeq = 0,
+	rollsSinceArm = 0,
+	exitMethod = "KICK_TP", -- KICK_TP | SHUTDOWN | TELEPORT
 	unitGuid = "Unknown",
 	unitName = "Unknown",
 	liveTrait = "N/A",
 	liveTokens = "Unknown",
-	armedBaseline = nil,
-	verdict = "Step 1: Click [1. Arm Rollback] BEFORE rolling, then roll manually.",
+	preRollBase = nil, -- Locked Pre-Roll Base saved before rolling
+	verdict = "Click [1. ARM PRE-ROLL BASE] BEFORE rolling to lock your pre-roll base.",
 	logs = {},
 }
 
@@ -69,30 +72,30 @@ local function setClipboardSafe(text)
 	return type(fn) == "function" and pcall(fn, text) or false
 end
 
-local function writeCheckpointFile(dataTable)
+local function writeBaseFile(tbl)
 	local writeFn = findExecutorFn("writefile")
 	if type(writeFn) == "function" and HttpService then
 		local okEnc, json = pcall(function()
-			return HttpService:JSONEncode(dataTable)
+			return HttpService:JSONEncode(tbl)
 		end)
 		if okEnc and json then
-			return pcall(writeFn, CHECKPOINT_FILE, json)
+			return pcall(writeFn, BASE_FILE, json)
 		end
 	end
 	return false
 end
 
-local function readCheckpointFile()
+local function readBaseFile()
 	local readFn = findExecutorFn("readfile")
 	local isFileFn = findExecutorFn("isfile")
 	if type(readFn) == "function" and HttpService then
 		if type(isFileFn) == "function" then
-			local okExists, exists = pcall(isFileFn, CHECKPOINT_FILE)
-			if not (okExists and exists) then
+			local okEx, ex = pcall(isFileFn, BASE_FILE)
+			if not (okEx and ex) then
 				return nil
 			end
 		end
-		local okRead, raw = pcall(readFn, CHECKPOINT_FILE)
+		local okRead, raw = pcall(readFn, BASE_FILE)
 		if okRead and type(raw) == "string" and raw ~= "" then
 			local okDec, tbl = pcall(function()
 				return HttpService:JSONDecode(raw)
@@ -103,6 +106,21 @@ local function readCheckpointFile()
 		end
 	end
 	return nil
+end
+
+local function clearBaseFile()
+	local delFn = findExecutorFn("delfile")
+	local isFileFn = findExecutorFn("isfile")
+	if type(delFn) == "function" then
+		local exists = true
+		if type(isFileFn) == "function" then
+			local okEx, ex = pcall(isFileFn, BASE_FILE)
+			exists = okEx and ex
+		end
+		if exists then
+			pcall(delFn, BASE_FILE)
+		end
+	end
 end
 
 local function addLog(tag, msg)
@@ -164,23 +182,32 @@ local function refreshUI()
 	pcall(scanGuiState)
 	pcall(function()
 		ui.statusLabel.Text = string.format(
-			"v2.2 Manual Gate | Rollback Mode: %s | Zero-Hook Safe",
-			state.rollbackArmed and "ARMED (WAITING YOUR DECISION)" or "STANDBY"
+			"v3.1 Pre-Roll Arm | Armed:%s (Arm#%d) | RollsAfterArm:%d | Cut:%s",
+			state.armed and "LOCKED" or "OFF",
+			state.armSeq,
+			state.rollsSinceArm,
+			state.exitMethod
 		)
 
-		local baseStr = "None"
-		if state.armedBaseline then
-			baseStr = string.format("%s | Tok=%s", tostring(state.armedBaseline.trait), tostring(state.armedBaseline.tokens))
+		local baseStr = "None (Not Armed Before Roll)"
+		if state.preRollBase then
+			baseStr = string.format(
+				"#%d [%s | Tok=%s]",
+				tonumber(state.preRollBase.armSeq) or 0,
+				tostring(state.preRollBase.trait),
+				tostring(state.preRollBase.tokens)
+			)
 		end
 
 		ui.boardBox.Text = table.concat({
 			string.format("Unit: %s | GUID: %s", tostring(state.unitName), tostring(state.unitGuid)),
-			string.format("Live: [%s | Tok=%s]   ||   Baseline: [%s]", tostring(state.liveTrait), tostring(state.liveTokens), baseStr),
+			string.format("Post-Roll Now: [%s | Tok=%s]  ||  Pre-Roll Base: %s", tostring(state.liveTrait), tostring(state.liveTokens), baseStr),
 			state.verdict,
 		}, "\n")
 
-		ui.armBtn.Text = state.rollbackArmed and "1. Rollback: ARMED" or "1. Arm Rollback"
-		ui.armBtn.BackgroundColor3 = state.rollbackArmed and C.warn or C.accent
+		ui.armBtn.Text = state.armed and string.format("1. BASE LOCKED (#%d)", state.armSeq) or "1. ARM PRE-ROLL BASE"
+		ui.armBtn.BackgroundColor3 = state.armed and C.warn or C.accent
+		ui.modeBtn.Text = "Cut: " .. state.exitMethod
 
 		local view = {}
 		for i = math.max(1, #state.logs - 16), #state.logs do
@@ -190,95 +217,129 @@ local function refreshUI()
 	end)
 end
 
-local function armRollbackMode()
+local function armPreRollBase()
 	pcall(scanGuiState)
-	local cp = {
+	state.armSeq += 1
+	state.rollsSinceArm = 0
+	local base = {
+		armSeq = state.armSeq,
 		unitGuid = tostring(state.unitGuid),
 		unitName = tostring(state.unitName),
 		trait = tostring(state.liveTrait),
 		tokens = tostring(state.liveTokens),
 		armedAt = os.time(),
 	}
-	state.armedBaseline = cp
-	state.rollbackArmed = true
-	local savedDisk = writeCheckpointFile(cp)
+	state.preRollBase = base
+	state.armed = true
+	local savedDisk = writeBaseFile(base)
 	state.verdict = string.format(
-		"ARMED (%s): Baseline=[%s, Tok=%s]. Now roll manually, then click Confirm Rollback or Keep!",
+		"PRE-ROLL BASE #%d LOCKED (%s): [%s | Tok=%s]. Roll manually now, then Confirm Rollback or Keep!",
+		state.armSeq,
 		savedDisk and "Disk+RAM" or "RAM",
-		cp.trait,
-		cp.tokens
+		base.trait,
+		base.tokens
 	)
-	addLog("ARMED", state.verdict)
+	addLog("ARM_BASE", state.verdict)
 	refreshUI()
 end
 
-local function keepResultAndDisarm()
+local function keepPostRollResult()
 	pcall(scanGuiState)
-	state.rollbackArmed = false
-	state.armedBaseline = nil
-	state.verdict = string.format("KEPT RESULT: Disarmed at [%s | Tok=%s].", tostring(state.liveTrait), tostring(state.liveTokens))
-	addLog("KEEP", state.verdict)
+	state.armed = false
+	state.rollsSinceArm = 0
+	state.preRollBase = nil
+	clearBaseFile()
+	state.verdict = string.format("KEPT RESULT: Cleared Pre-Roll Base & accepted [%s | Tok=%s].", tostring(state.liveTrait), tostring(state.liveTokens))
+	addLog("KEEP_RESULT", state.verdict)
 	refreshUI()
 end
 
-local function confirmManualRollbackAndRejoin()
-	pcall(scanGuiState)
-	if not state.armedBaseline then
-		state.armedBaseline = {
-			unitGuid = tostring(state.unitGuid),
-			unitName = tostring(state.unitName),
-			trait = tostring(state.liveTrait),
-			tokens = tostring(state.liveTokens),
-			armedAt = os.time(),
-		}
-		writeCheckpointFile(state.armedBaseline)
-	end
-
-	addLog(
-		"CONFIRM_RB",
-		string.format(
-			"Manual Rollback Confirmed! Baseline=[%s, Tok=%s] vs Current=[%s, Tok=%s] -> Triggering Rejoin...",
-			tostring(state.armedBaseline.trait),
-			tostring(state.armedBaseline.tokens),
-			tostring(state.liveTrait),
-			tostring(state.liveTokens)
-		)
-	)
-	refreshUI()
-
+local function executeSessionCut(method)
 	local lp = Players and Players.LocalPlayer
-	if TeleportService and lp then
+	if method == "TELEPORT" then
+		if TeleportService and lp then
+			pcall(function()
+				TeleportService:Teleport(game.PlaceId, lp)
+			end)
+		end
+	elseif method == "KICK_TP" then
+		if TeleportService and lp then
+			task.spawn(function()
+				pcall(function()
+					TeleportService:Teleport(game.PlaceId, lp)
+				end)
+			end)
+			task.wait(0.02)
+			pcall(function()
+				lp:Kick("RollbackLab v3.1 Pre-Roll Rollback Cut")
+			end)
+		end
+	elseif method == "SHUTDOWN" then
 		pcall(function()
-			TeleportService:Teleport(game.PlaceId, lp)
+			game:Shutdown()
 		end)
 	end
 end
 
-local function verifyPostRejoin()
+local function confirmPreRollRollback()
 	pcall(scanGuiState)
-	local cp = state.armedBaseline or readCheckpointFile()
-	if not cp then
-		state.verdict = "No armed baseline found. Click [1. Arm Rollback] before rolling."
-		addLog("VERIFY", "No baseline found.")
+	local base = state.preRollBase or readBaseFile()
+	if not base then
+		state.verdict = "ERROR: No Pre-Roll Base was armed before rolling! Click [1. ARM PRE-ROLL BASE] first."
+		addLog("CONFIRM_ERR", "Missing Pre-Roll Base.")
 		refreshUI()
 		return
 	end
 
-	state.armedBaseline = cp
-	local preTrait = tostring(cp.trait)
+	state.preRollBase = base
+	writeBaseFile(base)
+	addLog(
+		"CONFIRM_RB",
+		string.format(
+			"Confirming Rollback to Base #%d [%s, Tok=%s] from Post-Roll [%s, Tok=%s] via %s...",
+			tonumber(base.armSeq) or 0,
+			tostring(base.trait),
+			tostring(base.tokens),
+			tostring(state.liveTrait),
+			tostring(state.liveTokens),
+			state.exitMethod
+		)
+	)
+	refreshUI()
+	executeSessionCut(state.exitMethod)
+end
+
+local function verifyAgainstPreRollBase()
+	pcall(scanGuiState)
+	local base = state.preRollBase or readBaseFile()
+	if not base then
+		state.verdict = "No Pre-Roll Base found to compare against."
+		addLog("VERIFY", "No Pre-Roll Base found.")
+		refreshUI()
+		return
+	end
+
+	state.preRollBase = base
+	local preTrait = tostring(base.trait)
 	local nowTrait = tostring(state.liveTrait)
-	local preTok = tostring(cp.tokens)
+	local preTok = tostring(base.tokens)
 	local nowTok = tostring(state.liveTokens)
 
 	if preTrait == nowTrait and (preTok == "Unknown" or preTok == nowTok) then
 		state.verdict = string.format(
-			"RESULT: ROLLBACK SUCCEEDED! Returned to Baseline [%s | Tok=%s]",
-			preTrait, preTok
+			"VERDICT: ROLLBACK MATCHED PRE-ROLL BASE #%d! [%s | Tok=%s]",
+			tonumber(base.armSeq) or 0,
+			preTrait,
+			preTok
 		)
 	else
 		state.verdict = string.format(
-			"RESULT: SERVER COMMITTED (NO ROLLBACK) | Baseline:[%s, Tok=%s] -> Now:[%s, Tok=%s]",
-			preTrait, preTok, nowTrait, nowTok
+			"VERDICT: SERVER COMMITTED NEW STATE | Pre-Roll Base #%d:[%s, Tok=%s] -> Now:[%s, Tok=%s]",
+			tonumber(base.armSeq) or 0,
+			preTrait,
+			preTok,
+			nowTrait,
+			nowTok
 		)
 	end
 	addLog("VERIFY", state.verdict)
@@ -297,7 +358,7 @@ local function bindPassiveWatchers()
 						return
 					end
 					state.liveTokens = tostring(amount)
-					addLog("S2C_TOKEN", "Tokens updated = " .. state.liveTokens)
+					addLog("S2C_TOKEN", "Tokens = " .. state.liveTokens)
 					refreshUI()
 				end))
 			end
@@ -311,13 +372,18 @@ local function bindPassiveWatchers()
 					if unitId ~= nil then
 						state.unitGuid = tostring(unitId)
 					end
+					if state.armed then
+						state.rollsSinceArm += 1
+					end
 					task.defer(function()
 						task.wait(0.05)
 						pcall(scanGuiState)
 						addLog(
-							"MANUAL_ROLL",
+							"POST_ARM_ROLL",
 							string.format(
-								"Rolled -> Trait=%q | Tokens=%s (Decide now: Confirm Rollback or Keep!)",
+								"Roll #%d after Arm#%d -> Trait=%q | Tokens=%s",
+								state.rollsSinceArm,
+								state.armSeq,
 								state.liveTrait,
 								state.liveTokens
 							)
@@ -391,12 +457,12 @@ local function buildUI()
 	ui.screenGui.Name = APP_TAG
 	ui.screenGui.ResetOnSpawn = false
 	ui.screenGui.IgnoreGuiInset = true
-	ui.screenGui.DisplayOrder = 170
+	ui.screenGui.DisplayOrder = 185
 
 	ui.main = Instance.new("Frame")
 	ui.main.Name = "Main"
-	ui.main.Size = UDim2.new(0, 560, 0, 440)
-	ui.main.Position = UDim2.new(0.5, -280, 0.5, -220)
+	ui.main.Size = UDim2.new(0, 575, 0, 445)
+	ui.main.Position = UDim2.new(0.5, -287, 0.5, -222)
 	ui.main.BackgroundColor3 = C.bg
 	ui.main.BorderSizePixel = 0
 	ui.main.Parent = ui.screenGui
@@ -417,7 +483,7 @@ local function buildUI()
 	title.Font = Enum.Font.GothamBold
 	title.TextSize = 14
 	title.TextXAlignment = Enum.TextXAlignment.Left
-	title.Text = "ROLLBACK LAB v2.2 — MANUAL TWO-STAGE DECISION GATE"
+	title.Text = "ROLLBACK LAB v3.1 — TRUE PRE-ROLL ARM BASE ENGINE"
 	title.Parent = ui.dragBar
 
 	ui.closeBtn = Instance.new("TextButton")
@@ -474,15 +540,16 @@ local function buildUI()
 		return b
 	end
 
-	ui.armBtn = makeBtn("1. Arm Rollback", 12, 144, 130, C.accent)
-	ui.confirmBtn = makeBtn("2A. Confirm Rollback", 148, 144, 152, C.danger)
-	ui.keepBtn = makeBtn("2B. Keep Result", 306, 144, 118, C.good)
-	ui.verifyBtn = makeBtn("3. Check Rejoin", 430, 144, 118, C.btn)
+	ui.armBtn = makeBtn("1. ARM PRE-ROLL BASE", 12, 144, 152, C.accent)
+	ui.confirmBtn = makeBtn("2A. CONFIRM ROLLBACK", 170, 144, 156, C.danger)
+	ui.keepBtn = makeBtn("2B. KEEP RESULT", 332, 144, 114, C.good)
+	ui.verifyBtn = makeBtn("3. VERIFY BASE", 452, 144, 111, C.btn)
 
-	ui.copyBtn = makeBtn("Copy Full Report", 12, 180, 536, C.btn)
+	ui.modeBtn = makeBtn("Cut: KICK_TP", 12, 180, 145, C.btn)
+	ui.copyBtn = makeBtn("Copy v3.1 Report", 163, 180, 400, C.btn)
 
 	ui.logBox = Instance.new("TextBox")
-	ui.logBox.Size = UDim2.new(1, -24, 0, 212)
+	ui.logBox.Size = UDim2.new(1, -24, 0, 216)
 	ui.logBox.Position = UDim2.new(0, 12, 0, 216)
 	ui.logBox.BackgroundColor3 = C.panel
 	ui.logBox.BorderSizePixel = 0
@@ -503,22 +570,36 @@ end
 
 local function bindEvents()
 	bindSafeClick(ui.closeBtn, cleanupApp)
-	bindSafeClick(ui.armBtn, armRollbackMode)
-	bindSafeClick(ui.confirmBtn, confirmManualRollbackAndRejoin)
-	bindSafeClick(ui.keepBtn, keepResultAndDisarm)
-	bindSafeClick(ui.verifyBtn, verifyPostRejoin)
+	bindSafeClick(ui.armBtn, armPreRollBase)
+	bindSafeClick(ui.confirmBtn, confirmPreRollRollback)
+	bindSafeClick(ui.keepBtn, keepPostRollResult)
+	bindSafeClick(ui.verifyBtn, verifyAgainstPreRollBase)
+
+	local methods = { "KICK_TP", "SHUTDOWN", "TELEPORT" }
+	bindSafeClick(ui.modeBtn, function()
+		local idx = 1
+		for i, m in ipairs(methods) do
+			if m == state.exitMethod then
+				idx = (i % #methods) + 1
+				break
+			end
+		end
+		state.exitMethod = methods[idx]
+		addLog("CONFIG", "Cut mode -> " .. state.exitMethod)
+		refreshUI()
+	end)
 
 	bindSafeClick(ui.copyBtn, function()
 		pcall(scanGuiState)
 		local header = {
-			"=== ROLLBACK LAB v2.2 — MANUAL DECISION REPORT ===",
+			"=== ROLLBACK LAB v3.1 — PRE-ROLL ARM REPORT ===",
 			ui.statusLabel.Text,
 			ui.boardBox.Text,
 			"--- LOGS ---",
 		}
 		local full = table.concat(header, "\n") .. "\n" .. table.concat(state.logs, "\n")
 		local ok = setClipboardSafe(full)
-		addLog("EXPORT", ok and "Copied v2.2 report to clipboard." or "Clipboard unavailable.")
+		addLog("EXPORT", ok and "Copied v3.1 report to clipboard." or "Clipboard unavailable.")
 		refreshUI()
 	end)
 
@@ -577,16 +658,17 @@ task.defer(function()
 	bindPassiveWatchers()
 	pcall(scanGuiState)
 
-	local existingCp = readCheckpointFile()
-	if existingCp then
-		state.armedBaseline = existingCp
-		if existingCp.unitGuid and existingCp.unitGuid ~= "Unknown" then
-			state.unitGuid = existingCp.unitGuid
+	local existingBase = readBaseFile()
+	if existingBase then
+		state.preRollBase = existingBase
+		state.armSeq = tonumber(existingBase.armSeq) or state.armSeq
+		if existingBase.unitGuid and existingBase.unitGuid ~= "Unknown" then
+			state.unitGuid = existingBase.unitGuid
 		end
-		addLog("BOOT", string.format("Loaded Armed Baseline: %s | Tok=%s", tostring(existingCp.trait), tostring(existingCp.tokens)))
-		verifyPostRejoin()
+		addLog("BOOT", string.format("Loaded Pre-Roll Base #%d: %s | Tok=%s", state.armSeq, tostring(existingBase.trait), tostring(existingBase.tokens)))
+		verifyAgainstPreRollBase()
 	else
-		addLog("BOOT", "Rollback Lab v2.2 initialized (Manual Two-Stage Gate).")
+		addLog("BOOT", "Rollback Lab v3.1 ready. Arm Pre-Roll Base before rolling.")
 	end
 
 	refreshUI()
