@@ -12,9 +12,9 @@ local CoreGui = getServiceSafe("CoreGui")
 local UserInputService = getServiceSafe("UserInputService")
 local HttpService = getServiceSafe("HttpService")
 
-local APP_TAG = "RollbackLab_LiveTrial_v2_1b"
+local APP_TAG = "RollbackLab_ManualGate_v2_2"
 local GUARD_KEY = "__LiveTrialGuard_" .. APP_TAG
-local CHECKPOINT_FILE = "RollbackLab_v2_1_Checkpoint.json"
+local CHECKPOINT_FILE = "RollbackLab_v2_2_Checkpoint.json"
 
 local connections = {}
 local destroyed = false
@@ -34,19 +34,13 @@ local C = {
 }
 
 local state = {
-	armed = true,
-	trialCount = 0,
+	rollbackArmed = false,
 	unitGuid = "Unknown",
 	unitName = "Unknown",
 	liveTrait = "N/A",
 	liveTokens = "Unknown",
-	curseTokens = "Unknown",
-	statPreview = "N/A",
-	raceDelayMs = 0,
-	burstCount = 2,
-	lastSyncClock = 0,
-	savedCheckpoint = nil,
-	verdict = "Ready: Click Save Checkpoint or Run Rollback Race.",
+	armedBaseline = nil,
+	verdict = "Step 1: Click [1. Arm Rollback] BEFORE rolling, then roll manually.",
 	logs = {},
 }
 
@@ -82,8 +76,7 @@ local function writeCheckpointFile(dataTable)
 			return HttpService:JSONEncode(dataTable)
 		end)
 		if okEnc and json then
-			local okW = pcall(writeFn, CHECKPOINT_FILE, json)
-			return okW
+			return pcall(writeFn, CHECKPOINT_FILE, json)
 		end
 	end
 	return false
@@ -171,22 +164,23 @@ local function refreshUI()
 	pcall(scanGuiState)
 	pcall(function()
 		ui.statusLabel.Text = string.format(
-			"v2.1b Safe-Click | Monitor:%s | Burst:%dx | Delay:%dms | Trials:%d",
-			state.armed and "ON" or "OFF",
-			state.burstCount,
-			state.raceDelayMs,
-			state.trialCount
+			"v2.2 Manual Gate | Rollback Mode: %s | Zero-Hook Safe",
+			state.rollbackArmed and "ARMED (WAITING YOUR DECISION)" or "STANDBY"
 		)
+
+		local baseStr = "None"
+		if state.armedBaseline then
+			baseStr = string.format("%s | Tok=%s", tostring(state.armedBaseline.trait), tostring(state.armedBaseline.tokens))
+		end
+
 		ui.boardBox.Text = table.concat({
 			string.format("Unit: %s | GUID: %s", tostring(state.unitName), tostring(state.unitGuid)),
-			string.format("Live Trait: %s | Real Tokens: %s | Curse Tokens: %s", tostring(state.liveTrait), tostring(state.liveTokens), tostring(state.curseTokens)),
+			string.format("Live: [%s | Tok=%s]   ||   Baseline: [%s]", tostring(state.liveTrait), tostring(state.liveTokens), baseStr),
 			state.verdict,
 		}, "\n")
 
-		ui.armBtn.Text = state.armed and "1. Monitor: ON" or "1. Monitor: OFF"
-		ui.armBtn.BackgroundColor3 = state.armed and C.good or C.btn
-		ui.delayBtn.Text = string.format("Delay:%dms", state.raceDelayMs)
-		ui.burstBtn.Text = string.format("Burst:%dx", state.burstCount)
+		ui.armBtn.Text = state.rollbackArmed and "1. Rollback: ARMED" or "1. Arm Rollback"
+		ui.armBtn.BackgroundColor3 = state.rollbackArmed and C.warn or C.accent
 
 		local view = {}
 		for i = math.max(1, #state.logs - 16), #state.logs do
@@ -196,137 +190,99 @@ local function refreshUI()
 	end)
 end
 
-local function saveCheckpointNow(reasonTag)
+local function armRollbackMode()
 	pcall(scanGuiState)
 	local cp = {
 		unitGuid = tostring(state.unitGuid),
 		unitName = tostring(state.unitName),
 		trait = tostring(state.liveTrait),
 		tokens = tostring(state.liveTokens),
-		savedAt = os.time(),
+		armedAt = os.time(),
 	}
-	state.savedCheckpoint = cp
-	local savedToDisk = writeCheckpointFile(cp)
+	state.armedBaseline = cp
+	state.rollbackArmed = true
+	local savedDisk = writeCheckpointFile(cp)
 	state.verdict = string.format(
-		"Checkpoint [%s] (%s): Trait=%s | Tokens=%s",
-		reasonTag or "MANUAL",
-		savedToDisk and "Disk+RAM" or "RAM",
+		"ARMED (%s): Baseline=[%s, Tok=%s]. Now roll manually, then click Confirm Rollback or Keep!",
+		savedDisk and "Disk+RAM" or "RAM",
 		cp.trait,
 		cp.tokens
 	)
-	addLog("CHECKPOINT", state.verdict)
-	return cp
+	addLog("ARMED", state.verdict)
+	refreshUI()
 end
 
-local function evaluateAgainstCheckpoint()
+local function keepResultAndDisarm()
 	pcall(scanGuiState)
-	local cp = state.savedCheckpoint or readCheckpointFile()
+	state.rollbackArmed = false
+	state.armedBaseline = nil
+	state.verdict = string.format("KEPT RESULT: Disarmed at [%s | Tok=%s].", tostring(state.liveTrait), tostring(state.liveTokens))
+	addLog("KEEP", state.verdict)
+	refreshUI()
+end
+
+local function confirmManualRollbackAndRejoin()
+	pcall(scanGuiState)
+	if not state.armedBaseline then
+		state.armedBaseline = {
+			unitGuid = tostring(state.unitGuid),
+			unitName = tostring(state.unitName),
+			trait = tostring(state.liveTrait),
+			tokens = tostring(state.liveTokens),
+			armedAt = os.time(),
+		}
+		writeCheckpointFile(state.armedBaseline)
+	end
+
+	addLog(
+		"CONFIRM_RB",
+		string.format(
+			"Manual Rollback Confirmed! Baseline=[%s, Tok=%s] vs Current=[%s, Tok=%s] -> Triggering Rejoin...",
+			tostring(state.armedBaseline.trait),
+			tostring(state.armedBaseline.tokens),
+			tostring(state.liveTrait),
+			tostring(state.liveTokens)
+		)
+	)
+	refreshUI()
+
+	local lp = Players and Players.LocalPlayer
+	if TeleportService and lp then
+		pcall(function()
+			TeleportService:Teleport(game.PlaceId, lp)
+		end)
+	end
+end
+
+local function verifyPostRejoin()
+	pcall(scanGuiState)
+	local cp = state.armedBaseline or readCheckpointFile()
 	if not cp then
-		state.verdict = "No prior checkpoint found. Save Checkpoint first."
-		addLog("COMPARE", "No prior checkpoint file found.")
+		state.verdict = "No armed baseline found. Click [1. Arm Rollback] before rolling."
+		addLog("VERIFY", "No baseline found.")
+		refreshUI()
 		return
 	end
 
-	state.savedCheckpoint = cp
+	state.armedBaseline = cp
 	local preTrait = tostring(cp.trait)
 	local nowTrait = tostring(state.liveTrait)
 	local preTok = tostring(cp.tokens)
 	local nowTok = tostring(state.liveTokens)
 
-	local traitSameAsPre = (preTrait == nowTrait)
-	local tokSameAsPre = (preTok == "Unknown") or (preTok == nowTok)
-
-	if traitSameAsPre and tokSameAsPre then
+	if preTrait == nowTrait and (preTok == "Unknown" or preTok == nowTok) then
 		state.verdict = string.format(
-			"VERDICT: TRUE ROLLBACK / UNCHANGED | Pre:[%s, Tok=%s] == Now:[%s, Tok=%s]",
-			preTrait, preTok, nowTrait, nowTok
-		)
-	elseif (not traitSameAsPre) and (not tokSameAsPre) then
-		state.verdict = string.format(
-			"VERDICT: FORWARD COMMIT (SAVED) | Pre:[%s, Tok=%s] -> Now:[%s, Tok=%s]",
-			preTrait, preTok, nowTrait, nowTok
+			"RESULT: ROLLBACK SUCCEEDED! Returned to Baseline [%s | Tok=%s]",
+			preTrait, preTok
 		)
 	else
 		state.verdict = string.format(
-			"VERDICT: PARTIAL DESYNC! | Pre:[%s, Tok=%s] -> Now:[%s, Tok=%s]",
+			"RESULT: SERVER COMMITTED (NO ROLLBACK) | Baseline:[%s, Tok=%s] -> Now:[%s, Tok=%s]",
 			preTrait, preTok, nowTrait, nowTok
 		)
 	end
-	addLog("COMPARE", state.verdict)
-end
-
-local function triggerRejoin(newServer)
-	local lp = Players and Players.LocalPlayer
-	if not (TeleportService and lp) then
-		addLog("REJOIN_ERR", "TeleportService or LocalPlayer unavailable.")
-		refreshUI()
-		return
-	end
-	addLog("REJOIN", newServer and "Teleporting to fresh server..." or "Rejoining current PlaceId...")
+	addLog("VERIFY", state.verdict)
 	refreshUI()
-	local okTp, errTp = pcall(function()
-		if not newServer and game.JobId and game.JobId ~= "" then
-			TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, lp)
-		else
-			TeleportService:Teleport(game.PlaceId, lp)
-		end
-	end)
-	if not okTp then
-		addLog("TP_FAIL", tostring(errTp))
-		refreshUI()
-	end
-end
-
-local function getRerollEndpoint()
-	if not ReplicatedStorage then
-		return nil
-	end
-	local ep = ReplicatedStorage:FindFirstChild("endpoints")
-	local c2s = ep and ep:FindFirstChild("client_to_server")
-	return c2s and c2s:FindFirstChild("request_token_trait_reroll") or nil
-end
-
-local function executeRollbackRaceTrial()
-	addLog("CLICK", "Run Rollback Race pressed.")
-	refreshUI()
-
-	local cp = saveCheckpointNow("PRE_RACE")
-	local remote = getRerollEndpoint()
-
-	if not remote then
-		addLog("ERROR", "request_token_trait_reroll endpoint not found.")
-		refreshUI()
-		return
-	end
-
-	if cp.unitGuid == "Unknown" or cp.unitGuid == "" then
-		addLog("WARN", "GUID is Unknown! Perform 1 manual reroll first to capture GUID.")
-		state.verdict = "Action needed: Do 1 normal reroll first so GUID is captured."
-		refreshUI()
-		return
-	end
-
-	addLog("RACE_START", string.format("Firing %dx reroll on %s -> Rejoin in %dms", state.burstCount, cp.unitGuid, state.raceDelayMs))
-	refreshUI()
-
-	for i = 1, state.burstCount do
-		task.spawn(function()
-			pcall(function()
-				if remote:IsA("RemoteFunction") then
-					remote:InvokeServer(cp.unitGuid)
-				elseif remote:IsA("RemoteEvent") then
-					remote:FireServer(cp.unitGuid)
-				end
-			end)
-		end)
-	end
-
-	if state.raceDelayMs > 0 then
-		task.wait(state.raceDelayMs / 1000)
-	else
-		task.wait()
-	end
-	triggerRejoin(true)
 end
 
 local function bindPassiveWatchers()
@@ -337,12 +293,11 @@ local function bindPassiveWatchers()
 			local tokEv = s2c:FindFirstChild("token_trait_reroll_amount_changed")
 			if tokEv and tokEv:IsA("RemoteEvent") then
 				trackConn(tokEv.OnClientEvent:Connect(function(amount)
-					if destroyed or not state.armed then
+					if destroyed then
 						return
 					end
-					state.lastSyncClock = os.clock()
 					state.liveTokens = tostring(amount)
-					addLog("S2C_TOKEN", "Server Trait Tokens = " .. state.liveTokens)
+					addLog("S2C_TOKEN", "Tokens updated = " .. state.liveTokens)
 					refreshUI()
 				end))
 			end
@@ -350,27 +305,21 @@ local function bindPassiveWatchers()
 			local traitEv = s2c:FindFirstChild("unit_traits_changed")
 			if traitEv and traitEv:IsA("RemoteEvent") then
 				trackConn(traitEv.OnClientEvent:Connect(function(unitId)
-					if destroyed or not state.armed then
+					if destroyed then
 						return
 					end
-					state.trialCount += 1
 					if unitId ~= nil then
 						state.unitGuid = tostring(unitId)
 					end
-					local dtMs = state.lastSyncClock > 0 and ((os.clock() - state.lastSyncClock) * 1000) or 0
 					task.defer(function()
 						task.wait(0.05)
 						pcall(scanGuiState)
 						addLog(
-							"TRIAL_COMMIT",
+							"MANUAL_ROLL",
 							string.format(
-								"Trial #%d | Unit=%s (%s) | Trait=%q | Tokens=%s | Delta=%.1fms",
-								state.trialCount,
-								state.unitName,
-								state.unitGuid,
+								"Rolled -> Trait=%q | Tokens=%s (Decide now: Confirm Rollback or Keep!)",
 								state.liveTrait,
-								state.liveTokens,
-								dtMs
+								state.liveTokens
 							)
 						)
 						refreshUI()
@@ -387,11 +336,10 @@ local function bindPassiveWatchers()
 		local function watchText(obj)
 			if obj:IsA("TextLabel") and obj.Name == "CurrentTraitText" then
 				trackConn(obj:GetPropertyChangedSignal("Text"):Connect(function()
-					if destroyed or not state.armed then
+					if destroyed then
 						return
 					end
 					state.liveTrait = obj.Text
-					addLog("UI_SYNC", "CurrentTraitText -> " .. tostring(obj.Text))
 					refreshUI()
 				end))
 			end
@@ -401,9 +349,8 @@ local function bindPassiveWatchers()
 		end
 		trackConn(tr.DescendantAdded:Connect(function(d)
 			watchText(d)
-			if not destroyed and state.armed and d:IsA("TextLabel") and d.Name == "CurrentTraitText" then
+			if not destroyed and d:IsA("TextLabel") and d.Name == "CurrentTraitText" then
 				state.liveTrait = d.Text
-				addLog("UI_REBUILD", "CurrentTraitText rebuilt -> " .. tostring(d.Text))
 				refreshUI()
 			end
 		end))
@@ -415,7 +362,6 @@ local function cleanupApp()
 		return
 	end
 	destroyed = true
-	state.armed = false
 	for _, c in ipairs(connections) do
 		pcall(function()
 			c:Disconnect()
@@ -434,7 +380,7 @@ local function bindSafeClick(btn, fn)
 	trackConn(btn.MouseButton1Click:Connect(function()
 		local ok, err = pcall(fn)
 		if not ok then
-			addLog("BTN_ERR", tostring(err))
+			addLog("ERR", tostring(err))
 			refreshUI()
 		end
 	end))
@@ -445,12 +391,12 @@ local function buildUI()
 	ui.screenGui.Name = APP_TAG
 	ui.screenGui.ResetOnSpawn = false
 	ui.screenGui.IgnoreGuiInset = true
-	ui.screenGui.DisplayOrder = 165
+	ui.screenGui.DisplayOrder = 170
 
 	ui.main = Instance.new("Frame")
 	ui.main.Name = "Main"
-	ui.main.Size = UDim2.new(0, 560, 0, 450)
-	ui.main.Position = UDim2.new(0.5, -280, 0.5, -225)
+	ui.main.Size = UDim2.new(0, 560, 0, 440)
+	ui.main.Position = UDim2.new(0.5, -280, 0.5, -220)
 	ui.main.BackgroundColor3 = C.bg
 	ui.main.BorderSizePixel = 0
 	ui.main.Parent = ui.screenGui
@@ -471,7 +417,7 @@ local function buildUI()
 	title.Font = Enum.Font.GothamBold
 	title.TextSize = 14
 	title.TextXAlignment = Enum.TextXAlignment.Left
-	title.Text = "ROLLBACK LAB v2.1b — SAFE-CLICK LIVE ENGINE"
+	title.Text = "ROLLBACK LAB v2.2 — MANUAL TWO-STAGE DECISION GATE"
 	title.Parent = ui.dragBar
 
 	ui.closeBtn = Instance.new("TextButton")
@@ -497,7 +443,7 @@ local function buildUI()
 	ui.statusLabel.Parent = ui.main
 
 	ui.boardBox = Instance.new("TextLabel")
-	ui.boardBox.Size = UDim2.new(1, -24, 0, 72)
+	ui.boardBox.Size = UDim2.new(1, -24, 0, 74)
 	ui.boardBox.Position = UDim2.new(0, 12, 0, 62)
 	ui.boardBox.BackgroundColor3 = C.card
 	ui.boardBox.BorderSizePixel = 0
@@ -515,7 +461,7 @@ local function buildUI()
 
 	local function makeBtn(label, x, y, w, bg)
 		local b = Instance.new("TextButton")
-		b.Size = UDim2.new(0, w, 0, 28)
+		b.Size = UDim2.new(0, w, 0, 30)
 		b.Position = UDim2.new(0, x, 0, y)
 		b.BackgroundColor3 = bg
 		b.BorderSizePixel = 0
@@ -528,20 +474,16 @@ local function buildUI()
 		return b
 	end
 
-	ui.armBtn = makeBtn("1. Monitor: ON", 12, 142, 126, C.good)
-	ui.saveBtn = makeBtn("2. Save Checkpoint", 144, 142, 134, C.accent)
-	ui.cmpBtn = makeBtn("3. Compare Rejoin", 284, 142, 134, C.btn)
-	ui.copyBtn = makeBtn("Copy Report", 424, 142, 124, C.btn)
+	ui.armBtn = makeBtn("1. Arm Rollback", 12, 144, 130, C.accent)
+	ui.confirmBtn = makeBtn("2A. Confirm Rollback", 148, 144, 152, C.danger)
+	ui.keepBtn = makeBtn("2B. Keep Result", 306, 144, 118, C.good)
+	ui.verifyBtn = makeBtn("3. Check Rejoin", 430, 144, 118, C.btn)
 
-	ui.raceBtn = makeBtn("4. Run Rollback Race", 12, 176, 178, C.danger)
-	ui.burstBtn = makeBtn("Burst:2x", 196, 176, 78, C.btn)
-	ui.delayBtn = makeBtn("Delay:0ms", 280, 176, 86, C.btn)
-	ui.rejoinBtn = makeBtn("5. Rejoin", 372, 176, 84, C.warn)
-	ui.rejoinNewBtn = makeBtn("New Srv", 462, 176, 86, C.btn)
+	ui.copyBtn = makeBtn("Copy Full Report", 12, 180, 536, C.btn)
 
 	ui.logBox = Instance.new("TextBox")
-	ui.logBox.Size = UDim2.new(1, -24, 0, 226)
-	ui.logBox.Position = UDim2.new(0, 12, 0, 212)
+	ui.logBox.Size = UDim2.new(1, -24, 0, 212)
+	ui.logBox.Position = UDim2.new(0, 12, 0, 216)
 	ui.logBox.BackgroundColor3 = C.panel
 	ui.logBox.BorderSizePixel = 0
 	ui.logBox.TextColor3 = C.text
@@ -561,74 +503,22 @@ end
 
 local function bindEvents()
 	bindSafeClick(ui.closeBtn, cleanupApp)
-
-	bindSafeClick(ui.armBtn, function()
-		state.armed = not state.armed
-		addLog("MODE", state.armed and "Monitor enabled." or "Monitor paused.")
-		refreshUI()
-	end)
-
-	bindSafeClick(ui.saveBtn, function()
-		saveCheckpointNow("MANUAL")
-		refreshUI()
-	end)
-
-	bindSafeClick(ui.cmpBtn, function()
-		evaluateAgainstCheckpoint()
-		refreshUI()
-	end)
-
-	bindSafeClick(ui.raceBtn, executeRollbackRaceTrial)
-
-	local burstSteps = { 1, 2, 3, 5 }
-	bindSafeClick(ui.burstBtn, function()
-		local idx = 1
-		for i, v in ipairs(burstSteps) do
-			if v == state.burstCount then
-				idx = (i % #burstSteps) + 1
-				break
-			end
-		end
-		state.burstCount = burstSteps[idx]
-		addLog("CONFIG", string.format("Burst set to %dx.", state.burstCount))
-		refreshUI()
-	end)
-
-	local delaySteps = { 0, 5, 15, 30, 60 }
-	bindSafeClick(ui.delayBtn, function()
-		local idx = 1
-		for i, v in ipairs(delaySteps) do
-			if v == state.raceDelayMs then
-				idx = (i % #delaySteps) + 1
-				break
-			end
-		end
-		state.raceDelayMs = delaySteps[idx]
-		addLog("CONFIG", string.format("Delay set to %dms.", state.raceDelayMs))
-		refreshUI()
-	end)
-
-	bindSafeClick(ui.rejoinBtn, function()
-		saveCheckpointNow("PRE_REJOIN")
-		triggerRejoin(false)
-	end)
-
-	bindSafeClick(ui.rejoinNewBtn, function()
-		saveCheckpointNow("PRE_NEW_SRV")
-		triggerRejoin(true)
-	end)
+	bindSafeClick(ui.armBtn, armRollbackMode)
+	bindSafeClick(ui.confirmBtn, confirmManualRollbackAndRejoin)
+	bindSafeClick(ui.keepBtn, keepResultAndDisarm)
+	bindSafeClick(ui.verifyBtn, verifyPostRejoin)
 
 	bindSafeClick(ui.copyBtn, function()
 		pcall(scanGuiState)
 		local header = {
-			"=== ROLLBACK LAB v2.1b — REPORT ===",
+			"=== ROLLBACK LAB v2.2 — MANUAL DECISION REPORT ===",
 			ui.statusLabel.Text,
 			ui.boardBox.Text,
 			"--- LOGS ---",
 		}
 		local full = table.concat(header, "\n") .. "\n" .. table.concat(state.logs, "\n")
 		local ok = setClipboardSafe(full)
-		addLog("EXPORT", ok and "Copied v2.1b report to clipboard." or "Clipboard unavailable.")
+		addLog("EXPORT", ok and "Copied v2.2 report to clipboard." or "Clipboard unavailable.")
 		refreshUI()
 	end)
 
@@ -689,14 +579,14 @@ task.defer(function()
 
 	local existingCp = readCheckpointFile()
 	if existingCp then
-		state.savedCheckpoint = existingCp
+		state.armedBaseline = existingCp
 		if existingCp.unitGuid and existingCp.unitGuid ~= "Unknown" then
 			state.unitGuid = existingCp.unitGuid
 		end
-		addLog("BOOT", string.format("Restored Checkpoint: Unit=%s | Trait=%s | Tokens=%s", tostring(existingCp.unitName), tostring(existingCp.trait), tostring(existingCp.tokens)))
-		evaluateAgainstCheckpoint()
+		addLog("BOOT", string.format("Loaded Armed Baseline: %s | Tok=%s", tostring(existingCp.trait), tostring(existingCp.tokens)))
+		verifyPostRejoin()
 	else
-		addLog("BOOT", "Rollback Lab v2.1b initialized (Safe-Click).")
+		addLog("BOOT", "Rollback Lab v2.2 initialized (Manual Two-Stage Gate).")
 	end
 
 	refreshUI()
