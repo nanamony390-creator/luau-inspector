@@ -10,7 +10,7 @@ local ReplicatedStorage = getServiceSafe("ReplicatedStorage")
 local CoreGui = getServiceSafe("CoreGui")
 local UserInputService = getServiceSafe("UserInputService")
 
-local TEST_TAG = "RollbackTest02_CleanNoHook"
+local TEST_TAG = "RollbackTest03_PostExitConsistency"
 local GUARD_KEY = "__TestGuard_" .. TEST_TAG
 
 local connections = {}
@@ -31,7 +31,9 @@ local C = {
 
 local state = {
 	armed = false,
-	eventsCount = 0,
+	lastTokens = "Unknown",
+	lastUnitId = "Unknown",
+	lastTrait = "N/A",
 	logs = {},
 }
 
@@ -66,127 +68,118 @@ end
 local function addLog(tag, msg)
 	local line = string.format("[%s | %.2fs] %s", tag, os.clock() % 1000, msg)
 	state.logs[#state.logs + 1] = line
-	if #state.logs > 80 then
+	if #state.logs > 90 then
 		table.remove(state.logs, 1)
 	end
 end
 
-local function readLiveState()
+local function readCurrentTrait()
 	local lp = Players and Players.LocalPlayer
 	local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
 	local tr = pg and pg:FindFirstChild("TraitReroll")
-	if not tr then
-		return "TraitReroll=Closed", "N/A"
+	local cur = tr and tr:FindFirstChild("CurrentTraitText", true)
+	if cur and cur:IsA("TextLabel") and cur.Text ~= "" then
+		state.lastTrait = cur.Text
 	end
-
-	local traitVal = "N/A"
-	local cur = tr:FindFirstChild("CurrentTraitText", true)
-	if cur and cur:IsA("TextLabel") then
-		traitVal = cur.Text
-	end
-
-	local tokenInfo = {}
-	for _, d in ipairs(tr:GetDescendants()) do
-		if d:IsA("TextLabel") and (d.Name == "Quantity" or d.Name == "Amount") then
-			local pName = d.Parent and d.Parent.Parent and d.Parent.Parent.Name or "?"
-			if string.find(string.lower(pName), "reroll") or string.find(string.lower(pName), "token") then
-				tokenInfo[#tokenInfo + 1] = pName .. ":" .. tostring(d.Text)
-			end
-		end
-	end
-
-	local summary = "Trait=" .. tostring(traitVal)
-	if #tokenInfo > 0 then
-		summary = summary .. " | " .. table.concat(tokenInfo, ", ")
-	end
-	return summary, traitVal
+	return state.lastTrait
 end
 
 local function refreshUI()
 	if destroyed or not ui.main then
 		return
 	end
-	local summary, traitOnly = readLiveState()
+	local traitNow = readCurrentTrait()
 	pcall(function()
-		ui.statusLabel.Text = string.format("Mode: ZERO-HOOK SAFE | Armed: %s | Events: %d | Trait: %s", state.armed and "YES" or "NO", state.eventsCount, tostring(traitOnly))
+		ui.statusLabel.Text = string.format(
+			"Zero-Hook | Armed: %s | Tokens: %s | Trait: %s",
+			state.armed and "YES" or "NO",
+			tostring(state.lastTokens),
+			tostring(traitNow)
+		)
 		ui.summaryBox.Text = table.concat({
-			"=== TEST #2 (CLEAN): S2C EVENT & UI SYNC TIMING ===",
-			"Zero hooks installed. Measures exact server event arrival vs UI update.",
-			"Live: " .. summary,
+			"=== TEST #3: POST-EXIT STATE CONSISTENCY ===",
+			"Unit GUID: " .. tostring(state.lastUnitId),
+			"Observed Tokens: " .. tostring(state.lastTokens) .. "  |  Current Trait: " .. tostring(traitNow),
 		}, "\n")
-		ui.armBtn.Text = state.armed and "1. Listener: ON (Click to Pause)" or "1. Start Clean Listener"
+		ui.armBtn.Text = state.armed and "1. Watch: ON (Click to Pause)" or "1. Start Watch"
 		ui.armBtn.BackgroundColor3 = state.armed and C.good or C.accent
 
 		local view = {}
 		for i = math.max(1, #state.logs - 16), #state.logs do
 			view[#view + 1] = state.logs[i]
 		end
-		ui.logBox.Text = (#view > 0) and table.concat(view, "\n") or "Ready. Click Start Clean Listener, then do 1 normal Trait Reroll."
+		ui.logBox.Text = (#view > 0) and table.concat(view, "\n") or "Ready. Start Watch, do 1 reroll, copy pre-exit report, then Rejoin and check."
 	end)
 end
 
-local function bindSafeListeners()
-	-- 1. Official server_to_client RemoteEvents (passive read-only)
+local function bindListeners()
 	if ReplicatedStorage then
 		local ep = ReplicatedStorage:FindFirstChild("endpoints")
 		local s2c = ep and ep:FindFirstChild("server_to_client")
 		if s2c then
-			for _, child in ipairs(s2c:GetChildren()) do
-				if child:IsA("RemoteEvent") and (string.find(child.Name, "reroll") or string.find(child.Name, "trait") or string.find(child.Name, "unit")) then
-					trackConn(child.OnClientEvent:Connect(function(...)
-						if destroyed or not state.armed then
-							return
-						end
-						state.eventsCount += 1
-						local args = table.pack(...)
-						local parts = {}
-						for i = 1, math.min(args.n, 4) do
-							parts[#parts + 1] = tostring(args[i])
-						end
-						addLog("S2C_EVENT", string.format("%s -> [%s] | Live: %s", child.Name, table.concat(parts, ", "), select(1, readLiveState())))
+			local tokEv = s2c:FindFirstChild("token_trait_reroll_amount_changed")
+			if tokEv and tokEv:IsA("RemoteEvent") then
+				trackConn(tokEv.OnClientEvent:Connect(function(amount, ...)
+					if destroyed or not state.armed then
+						return
+					end
+					state.lastTokens = tostring(amount)
+					addLog("TOKEN_SYNC", "token_trait_reroll_amount_changed -> " .. state.lastTokens)
+					refreshUI()
+				end))
+			end
+
+			local traitEv = s2c:FindFirstChild("unit_traits_changed")
+			if traitEv and traitEv:IsA("RemoteEvent") then
+				trackConn(traitEv.OnClientEvent:Connect(function(unitId, payload, ...)
+					if destroyed or not state.armed then
+						return
+					end
+					if unitId ~= nil then
+						state.lastUnitId = tostring(unitId)
+					end
+					local pInfo = typeof(payload) == "table" and "table" or tostring(payload)
+					task.defer(function()
+						task.wait(0.05)
+						local trNow = readCurrentTrait()
+						addLog("UNIT_TRAIT_SYNC", string.format("Unit=%s (%s) | Trait=%q | Tokens=%s", state.lastUnitId, pInfo, trNow, state.lastTokens))
 						refreshUI()
-					end))
-				end
+					end)
+				end))
 			end
 		end
 	end
 
-	-- 2. Passive GUI property listener
 	local lp = Players and Players.LocalPlayer
 	local pg = lp and lp:FindFirstChildOfClass("PlayerGui")
 	local tr = pg and pg:FindFirstChild("TraitReroll")
 	if tr then
-		local function watchLabel(lbl)
-			if lbl:IsA("TextLabel") and (lbl.Name == "CurrentTraitText" or lbl.Name == "Quantity" or lbl.Name == "Amount") then
-				local last = lbl.Text
-				trackConn(lbl:GetPropertyChangedSignal("Text"):Connect(function()
+		local function hookText(obj)
+			if obj:IsA("TextLabel") and obj.Name == "CurrentTraitText" then
+				trackConn(obj:GetPropertyChangedSignal("Text"):Connect(function()
 					if destroyed or not state.armed then
-						last = lbl.Text
 						return
 					end
-					local now = lbl.Text
-					if now ~= last then
-						state.eventsCount += 1
-						addLog("UI_TEXT", string.format("%s: %q -> %q", lbl.Name, last, now))
-						last = now
-						refreshUI()
-					end
+					state.lastTrait = obj.Text
+					addLog("UI_TRAIT", "CurrentTraitText -> " .. tostring(obj.Text))
+					refreshUI()
 				end))
 			end
 		end
 		for _, d in ipairs(tr:GetDescendants()) do
-			watchLabel(d)
+			hookText(d)
 		end
 		trackConn(tr.DescendantAdded:Connect(function(d)
-			watchLabel(d)
+			hookText(d)
 			if not destroyed and state.armed and d:IsA("TextLabel") and d.Name == "CurrentTraitText" then
-				state.eventsCount += 1
-				addLog("UI_REBUILT", "CurrentTraitText recreated with value: " .. tostring(d.Text))
+				state.lastTrait = d.Text
+				addLog("UI_REBUILT", "CurrentTraitText -> " .. tostring(d.Text))
 				refreshUI()
 			end
 		end))
 	end
-	addLog("INIT", "Clean passive listeners attached (0 hooks).")
+
+	addLog("INIT", "Test #3 zero-hook listeners ready.")
 end
 
 local function cleanupTest()
@@ -214,7 +207,7 @@ local function buildUI()
 	ui.screenGui.Name = TEST_TAG
 	ui.screenGui.ResetOnSpawn = false
 	ui.screenGui.IgnoreGuiInset = true
-	ui.screenGui.DisplayOrder = 140
+	ui.screenGui.DisplayOrder = 145
 
 	ui.main = Instance.new("Frame")
 	ui.main.Name = "Main"
@@ -240,7 +233,7 @@ local function buildUI()
 	title.Font = Enum.Font.GothamBold
 	title.TextSize = 14
 	title.TextXAlignment = Enum.TextXAlignment.Left
-	title.Text = "TEST #2 (CLEAN): S2C EVENT & UI SYNC"
+	title.Text = "TEST #3: POST-EXIT STATE CONSISTENCY"
 	title.Parent = ui.dragBar
 
 	ui.closeBtn = Instance.new("TextButton")
@@ -297,9 +290,9 @@ local function buildUI()
 		return b
 	end
 
-	ui.armBtn = makeBtn("1. Start Clean Listener", 12, 134, 180, C.accent)
-	ui.snapBtn = makeBtn("2. Snapshot State", 198, 134, 140, C.btn)
-	ui.copyBtn = makeBtn("Copy Clean Log", 344, 134, 144, C.btn)
+	ui.armBtn = makeBtn("1. Start Watch", 12, 134, 165, C.accent)
+	ui.snapBtn = makeBtn("2. Mark Pre-Exit", 183, 134, 155, C.btn)
+	ui.copyBtn = makeBtn("Copy Test #3 Log", 344, 134, 144, C.btn)
 
 	ui.logBox = Instance.new("TextBox")
 	ui.logBox.Size = UDim2.new(1, -24, 0, 210)
@@ -325,23 +318,24 @@ local function bindEvents()
 	trackConn(ui.closeBtn.Activated:Connect(cleanupTest))
 	trackConn(ui.armBtn.Activated:Connect(function()
 		state.armed = not state.armed
-		addLog("STATE", state.armed and "Listener ON: perform 1 Trait Reroll now." or "Listener PAUSED.")
+		addLog("STATE", state.armed and "Watch ON: perform 1 reroll." or "Watch PAUSED.")
 		refreshUI()
 	end))
 	trackConn(ui.snapBtn.Activated:Connect(function()
-		addLog("SNAP", select(1, readLiveState()))
+		local tr = readCurrentTrait()
+		addLog("PRE_EXIT_MARK", string.format("Unit=%s | Tokens=%s | Trait=%q", state.lastUnitId, state.lastTokens, tr))
 		refreshUI()
 	end))
 	trackConn(ui.copyBtn.Activated:Connect(function()
 		local header = {
-			"=== TEST #2 CLEAN REPORT (ZERO HOOKS) ===",
+			"=== TEST #3 REPORT: POST-EXIT STATE CONSISTENCY ===",
 			ui.statusLabel.Text,
 			ui.summaryBox.Text,
 			"--- LOGS ---",
 		}
 		local full = table.concat(header, "\n") .. "\n" .. table.concat(state.logs, "\n")
 		local ok = setClipboardSafe(full)
-		addLog("EXPORT", ok and "Copied Clean Log." or "Clipboard unavailable.")
+		addLog("EXPORT", ok and "Copied Test #3 report." or "Clipboard unavailable.")
 		refreshUI()
 	end))
 
@@ -397,6 +391,6 @@ task.defer(function()
 	buildUI()
 	bindEvents()
 	ui.screenGui.Parent = parent
-	bindSafeListeners()
+	bindListeners()
 	refreshUI()
 end)
